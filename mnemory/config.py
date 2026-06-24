@@ -147,7 +147,7 @@ class ArtifactConfig:
 
     # S3 / MinIO settings
     s3_endpoint: str = field(
-        default_factory=lambda: _env("S3_ENDPOINT", "http://localhost:9000")
+        default_factory=lambda: _env("S3_ENDPOINT", "")
     )
     s3_access_key: str = field(default_factory=lambda: _env("S3_ACCESS_KEY"))
     s3_secret_key: str = field(default_factory=lambda: _env("S3_SECRET_KEY"))
@@ -628,11 +628,7 @@ class Config:
                 "Must be one of: passive, proactive, personality"
             )
         if self.artifact.backend == "s3":
-            if not self.artifact.s3_access_key or not self.artifact.s3_secret_key:
-                raise ValueError(
-                    "S3_ACCESS_KEY and S3_SECRET_KEY are required "
-                    "when ARTIFACT_BACKEND=s3"
-                )
+            pass
         if self.memory.session_backend not in ("memory", "sqlite", "redis"):
             raise ValueError(
                 f"Unsupported SESSION_BACKEND: {self.memory.session_backend}. "

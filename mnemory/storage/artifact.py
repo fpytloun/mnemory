@@ -139,11 +139,13 @@ class S3Backend:
         from botocore.config import Config as BotoConfig
 
         kwargs: dict[str, Any] = {
-            "endpoint_url": config.s3_endpoint,
-            "aws_access_key_id": config.s3_access_key,
-            "aws_secret_access_key": config.s3_secret_key,
             "config": BotoConfig(signature_version="s3v4"),
         }
+        if config.s3_endpoint:
+            kwargs["endpoint_url"] = config.s3_endpoint
+        if config.s3_access_key and config.s3_secret_key:
+            kwargs["aws_access_key_id"] = config.s3_access_key
+            kwargs["aws_secret_access_key"] = config.s3_secret_key
         if config.s3_region:
             kwargs["region_name"] = config.s3_region
 

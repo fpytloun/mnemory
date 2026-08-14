@@ -15,7 +15,7 @@ RUN pip install --no-cache-dir ".[all]" \
 
 # Stage 2: Copy full source and install the package (no deps needed).
 COPY mnemory/ mnemory/
-RUN pip install --no-cache-dir --no-deps .
+RUN pip install --no-cache-dir --no-deps "mcp<2" "httpx-sse" "pydantic-settings" "python-dotenv" .
 
 # Pre-download BM25 sparse embedding model into the image so containers
 # start without network dependency (Kubernetes pods lose cache on restart).

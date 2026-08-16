@@ -193,15 +193,18 @@ export function createHooks(ctx: PluginContext) {
         sessionID?: string;
         info?: { id?: string; parentID?: string };
       };
-      const sessionId = props?.sessionID ?? props?.info?.id;
-      if (!sessionId) return;
+      const sessionKey = props?.sessionID ?? props?.info?.id;
+      if (!sessionKey) return;
 
-      const state = store.getOrCreate(sessionId);
+      const state = store.getOrCreate(sessionKey);
+      if (props?.info?.id) {
+        state.opencodeSessionId = props.info.id;
+      }
 
       // Detect child sessions (sub-agents) — skip recall to avoid duplicate context
       if (props?.info?.parentID) {
         state.isChildSession = true;
-        logger.info(`Child session detected: ${sessionId} (parent: ${props.info.parentID})`);
+        logger.info(`Child session detected: ${sessionKey} (parent: ${props.info.parentID})`);
         return;
       }
 
@@ -217,10 +220,16 @@ export function createHooks(ctx: PluginContext) {
 
       const state = store.getOrCreate(sessionId);
       if (state.isChildSession) return;
+      const opencodeSessionId = state.opencodeSessionId;
+      if (!opencodeSessionId) {
+        logger.warn(
+          `Auto-capture skipped: canonical OpenCode session ID is unavailable for ${sessionId}`,
+        );
+        return;
+      }
 
       try {
         // Get session messages via OpenCode SDK.
-        // The SDK path key may be "sessionID" or "id" depending on version.
         const sdkClient = ctx.sdkClient as {
           session?: {
             messages?: (opts: {
@@ -229,26 +238,9 @@ export function createHooks(ctx: PluginContext) {
           };
         };
 
-        // Try "sessionID" first (newer SDK), fall back to "id" (older SDK).
-        // Wrap each attempt in its own try block so a throw on the first
-        // attempt still allows the fallback to run.
-        let response: { data?: unknown[] } | undefined;
-        try {
-          response = await sdkClient?.session?.messages?.({
-            path: { sessionID: sessionId },
-          });
-        } catch {
-          // Ignore — will try fallback below
-        }
-        if (!response?.data) {
-          try {
-            response = await sdkClient?.session?.messages?.({
-              path: { id: sessionId },
-            });
-          } catch {
-            // Both attempts failed
-          }
-        }
+        const response = await sdkClient?.session?.messages?.({
+          path: { sessionID: opencodeSessionId },
+        });
 
         const messages = (response?.data ?? []) as unknown[];
         if (messages.length === 0) return;
@@ -306,9 +298,12 @@ export function createHooks(ctx: PluginContext) {
       // (which would cause duplicate remember calls).
       const postCompactionCount = props?.messageCount ?? 0;
 
-      // Reset recall state but preserve message tracking
+      // Reset recall state but preserve message tracking and the canonical
+      // OpenCode ID required by the SDK.
+      const previousState = store.getOrCreate(sessionId);
       const state = store.reset(sessionId);
       state.lastMessageCount = postCompactionCount;
+      state.opencodeSessionId = previousState.opencodeSessionId;
       logger.info(
         `Session compacted, resetting state: ${sessionId} (messageCount=${postCompactionCount})`,
       );

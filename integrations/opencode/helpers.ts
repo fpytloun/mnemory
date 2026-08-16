@@ -133,6 +133,8 @@ export function createLogger(
 // ============================================================================
 
 export type SessionState = {
+  /** Canonical OpenCode session ID used by the OpenCode SDK. */
+  opencodeSessionId: string | null;
   /** Mnemory-side session ID (returned by /api/recall). */
   mnemorySessionId: string | null;
   /** Number of messages already processed for auto-capture. */
@@ -160,6 +162,7 @@ export function createSessionStore(logger: Logger) {
 
   function createState(): SessionState {
     return {
+      opencodeSessionId: null,
       mnemorySessionId: null,
       lastMessageCount: 0,
       turnCount: 0,

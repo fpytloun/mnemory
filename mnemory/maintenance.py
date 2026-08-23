@@ -51,11 +51,7 @@ def gc_superseded_raw(
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
 
-    # Scroll only raw memories for this user
-    all_memories = vector.scroll_with_vectors(
-        user_id=user_id,
-        exclude_expired=False,
-    )
+    all_memories = vector.scroll_gc_metadata(user_id=user_id)
 
     deleted = 0
     for mem in all_memories:
@@ -339,25 +335,52 @@ class MaintenanceService:
 
     async def _run_consolidation(self) -> None:
         """Run within-session consolidation for all users with idle sessions."""
-        user_ids: list[str] = await asyncio.to_thread(
-            self._consolidation._vector.list_user_ids
+        candidates: list[dict[str, Any]] = await asyncio.to_thread(
+            self._consolidation._sessions.scan_consolidation_candidates
         )
-        if not user_ids:
+        if not candidates:
             return
+        by_user: dict[str, list[dict[str, Any]]] = {}
+        for session in candidates:
+            by_user.setdefault(session["user_id"], []).append(session)
 
         total_processed = 0
         total_succeeded = 0
         total_failed = 0
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=self._config.memory.consolidation_idle_threshold
+        )
 
-        for user_id in user_ids:
+        for user_id, sessions in by_user.items():
             try:
-                # Recover any incomplete consolidations first
-                await asyncio.to_thread(self._consolidation.recover_incomplete, user_id)
+                pending: list[dict[str, Any]] = []
+                for session in sessions:
+                    if session.get("consolidation_state") == "consolidating":
+                        try:
+                            completed = await asyncio.to_thread(
+                                self._consolidation.recover_session,
+                                session,
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Recovery failed for session %s, continuing",
+                                session.get("session_id", ""),
+                            )
+                            continue
+                        if completed:
+                            continue
 
-                # Find pending sessions
-                pending = await asyncio.to_thread(
-                    self._consolidation.find_pending_sessions, user_id
-                )
+                    updated_at_str = session.get("updated_at", "")
+                    if not updated_at_str or not session.get("memory_ids"):
+                        continue
+                    try:
+                        updated_at = datetime.fromisoformat(updated_at_str)
+                    except (TypeError, ValueError):
+                        continue
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    if updated_at < cutoff:
+                        pending.append(session)
                 if not pending:
                     continue
 

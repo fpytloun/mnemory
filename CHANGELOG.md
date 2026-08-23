@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [1.12.2] — 2026-08-23
+
+### Bug Fixes
+
+- **Consolidation recovery isolation** — Continued recovery and consolidation for other sessions when one session recovery fails.
+- **Metrics and maintenance Qdrant scans** — Reduced Qdrant scan load, refreshed metrics asynchronously, and kept complete metric snapshots available during refresh.
+
 ## [1.12.1] — 2026-05-07
 
 ### Bug Fixes

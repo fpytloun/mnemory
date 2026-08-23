@@ -105,7 +105,10 @@ class MetricsCollector:
 
         # Cache state
         self._cache_lock = threading.Lock()
-        self._cache_timestamp: float = 0.0
+        self._exposition_lock = threading.RLock()
+        self._last_success_at: float = 0.0
+        self._retry_after: float = 0.0
+        self._refresh_in_flight = False
 
         # Optional reference to MaintenanceService for schedule info.
         self._maintenance: Any = None
@@ -336,6 +339,7 @@ class MetricsCollector:
         self._thread_pool = executor
         if hasattr(executor, "_max_workers"):
             self._thread_pool_size.set(executor._max_workers)
+        self.collect_gauges()
 
     def record_operation(
         self,
@@ -503,25 +507,48 @@ class MetricsCollector:
             spawned = len(getattr(self._thread_pool, "_threads", set()))
             self._thread_pool_threads.set(spawned)
 
-        # Check cache
+        # Submit one asynchronous refresh when stale. Callers keep using the
+        # last complete gauge snapshot while it runs.
         now = time.monotonic()
         with self._cache_lock:
-            if now - self._cache_timestamp < self._cache_ttl:
-                return  # Cache is fresh
-            # Mark as refreshing (prevents concurrent refreshes)
-            self._cache_timestamp = now
-
+            if self._refresh_in_flight:
+                return
+            if self._last_success_at and now - self._last_success_at < self._cache_ttl:
+                return
+            if now < self._retry_after or self._thread_pool is None:
+                return
+            self._refresh_in_flight = True
         try:
-            self._refresh_gauges_from_qdrant()
+            future = self._thread_pool.submit(self._refresh_gauges_from_qdrant)
+            future.add_done_callback(self._finish_gauge_refresh)
         except Exception:
-            logger.warning("Failed to refresh metrics from Qdrant", exc_info=True)
-            # Reset cache timestamp so next scrape retries
             with self._cache_lock:
-                self._cache_timestamp = 0.0
+                self._refresh_in_flight = False
+                self._retry_after = time.monotonic() + self._cache_ttl
+            logger.warning("Failed to submit metrics refresh", exc_info=True)
+
+    def _finish_gauge_refresh(self, future: Any) -> None:
+        """Update cache timing after an asynchronous refresh finishes."""
+        completed_at = time.monotonic()
+        error = future.exception()
+        with self._cache_lock:
+            self._refresh_in_flight = False
+            if error is None:
+                self._last_success_at = completed_at
+                self._retry_after = 0.0
+            else:
+                self._retry_after = completed_at + self._cache_ttl
+        if error is not None:
+            logger.warning(
+                "Failed to refresh metrics from Qdrant",
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     def generate_metrics(self) -> bytes:
         """Generate Prometheus text exposition format output."""
-        return generate_latest(self._registry)
+        self.collect_gauges()
+        with self._exposition_lock:
+            return generate_latest(self._registry)
 
     @property
     def content_type(self) -> str:
@@ -529,14 +556,18 @@ class MetricsCollector:
         return CONTENT_TYPE_LATEST
 
     def get_stats_json(self) -> dict:
+        """Return an atomic JSON snapshot for the management UI."""
+        self.collect_gauges()
+        with self._exposition_lock:
+            return self._get_stats_json_unlocked()
+
+    def _get_stats_json_unlocked(self) -> dict:
         """Return metrics as a JSON-serializable dict for the management UI.
 
         Calls collect_gauges() to ensure freshness, then reads the internal
         prometheus_client gauge/counter values to build a structured response.
         Reuses the cached Qdrant aggregation — no extra scroll.
         """
-        self.collect_gauges()
-
         from mnemory import __version__
 
         totals = {
@@ -834,9 +865,20 @@ class MetricsCollector:
         # (user_id, memory_layer) -> count
         by_layer: dict[tuple[str, str], int] = defaultdict(int)
 
-        # Scroll all points (no vectors, payloads only)
+        # Scroll all points (no vectors, selected payload fields only)
         offset = None
-        batch_size = 256
+        batch_size = 2048
+        payload_fields = [
+            "user_id",
+            "agent_id",
+            "memory_type",
+            "role",
+            "memory_layer",
+            "decayed_at",
+            "pinned",
+            "artifacts",
+            "categories",
+        ]
 
         while True:
             points, next_offset = client.scroll(
@@ -844,7 +886,7 @@ class MetricsCollector:
                 scroll_filter=None,
                 limit=batch_size,
                 offset=offset,
-                with_payload=True,
+                with_payload=payload_fields,
                 with_vectors=False,
             )
 
@@ -883,52 +925,52 @@ class MetricsCollector:
                 break
             offset = next_offset
 
-        # Clear existing gauge label sets to remove stale entries
-        self._memories_total._metrics.clear()
-        self._memories_decayed._metrics.clear()
-        self._memories_pinned._metrics.clear()
-        self._memories_by_category._metrics.clear()
-        self._memories_by_layer._metrics.clear()
-        self._memories_with_artifacts._metrics.clear()
+        with self._exposition_lock:
+            # Clear and replace all Qdrant-backed labels as one snapshot.
+            self._memories_total._metrics.clear()
+            self._memories_decayed._metrics.clear()
+            self._memories_pinned._metrics.clear()
+            self._memories_by_category._metrics.clear()
+            self._memories_by_layer._metrics.clear()
+            self._memories_with_artifacts._metrics.clear()
 
-        # Set new values
-        for (uid, aid, mtype, role), count in total.items():
-            self._memories_total.labels(
-                user_id=uid,
-                agent_id=aid,
-                memory_type=mtype,
-                role=role,
-            ).set(count)
+            for (uid, aid, mtype, role), count in total.items():
+                self._memories_total.labels(
+                    user_id=uid,
+                    agent_id=aid,
+                    memory_type=mtype,
+                    role=role,
+                ).set(count)
 
-        for (uid, aid), count in decayed.items():
-            self._memories_decayed.labels(
-                user_id=uid,
-                agent_id=aid,
-            ).set(count)
+            for (uid, aid), count in decayed.items():
+                self._memories_decayed.labels(
+                    user_id=uid,
+                    agent_id=aid,
+                ).set(count)
 
-        for (uid, aid), count in pinned.items():
-            self._memories_pinned.labels(
-                user_id=uid,
-                agent_id=aid,
-            ).set(count)
+            for (uid, aid), count in pinned.items():
+                self._memories_pinned.labels(
+                    user_id=uid,
+                    agent_id=aid,
+                ).set(count)
 
-        for (uid, cat), count in by_category.items():
-            self._memories_by_category.labels(
-                user_id=uid,
-                category=cat,
-            ).set(count)
+            for (uid, cat), count in by_category.items():
+                self._memories_by_category.labels(
+                    user_id=uid,
+                    category=cat,
+                ).set(count)
 
-        for (uid, layer), count in by_layer.items():
-            self._memories_by_layer.labels(
-                user_id=uid,
-                memory_layer=layer,
-            ).set(count)
+            for (uid, layer), count in by_layer.items():
+                self._memories_by_layer.labels(
+                    user_id=uid,
+                    memory_layer=layer,
+                ).set(count)
 
-        for (uid, aid), count in with_artifacts.items():
-            self._memories_with_artifacts.labels(
-                user_id=uid,
-                agent_id=aid,
-            ).set(count)
+            for (uid, aid), count in with_artifacts.items():
+                self._memories_with_artifacts.labels(
+                    user_id=uid,
+                    agent_id=aid,
+                ).set(count)
 
         logger.debug(
             "Metrics refreshed: %d label sets across %d points",

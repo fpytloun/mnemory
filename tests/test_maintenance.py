@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
-from mnemory.maintenance import _SEVERITY_ORDER, MaintenanceService
+from mnemory.maintenance import (
+    _SEVERITY_ORDER,
+    MaintenanceService,
+    gc_superseded_raw,
+)
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -102,6 +107,108 @@ class TestMaintenanceService:
             assert svc._task is None
 
             await svc.stop()  # no-op, should not raise
+
+        asyncio.run(_run())
+
+    def test_consolidation_uses_one_global_scan_and_recovers_first(self):
+        """Maintenance uses one session scan and retries reset idle sessions."""
+
+        async def _run():
+            old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+            consolidation = MagicMock()
+            consolidation._sessions.scan_consolidation_candidates.return_value = [
+                {
+                    "session_id": "completed",
+                    "user_id": "alice",
+                    "updated_at": old,
+                    "memory_ids": ["m1"],
+                    "consolidation_state": "consolidating",
+                    "consolidated_memory_ids": ["c1"],
+                },
+                {
+                    "session_id": "retry",
+                    "user_id": "alice",
+                    "updated_at": old,
+                    "memory_ids": ["m2"],
+                    "consolidation_state": "consolidating",
+                },
+                {
+                    "session_id": "idle",
+                    "user_id": "bob",
+                    "updated_at": old,
+                    "memory_ids": ["m3"],
+                    "consolidation_state": "idle",
+                },
+            ]
+            consolidation.recover_session.side_effect = [True, False]
+            result = MagicMock()
+            result.state = "consolidated"
+            consolidation.consolidate_session.return_value = result
+            service = MaintenanceService(
+                config=_make_config(),
+                fsck=_make_fsck_service(),
+                consolidation=consolidation,
+            )
+
+            await service._run_consolidation()
+
+            consolidation._sessions.scan_consolidation_candidates.assert_called_once_with()
+            consolidation._vector.list_user_ids.assert_not_called()
+            assert [
+                call.args[0]
+                for call in consolidation.consolidate_session.call_args_list
+            ] == ["retry", "idle"]
+
+        asyncio.run(_run())
+
+    def test_consolidation_isolates_recovery_errors_per_session(self):
+        """One recovery error does not block other sessions for the user."""
+
+        async def _run():
+            old = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+            consolidation = MagicMock()
+            consolidation._sessions.scan_consolidation_candidates.return_value = [
+                {
+                    "session_id": "broken",
+                    "user_id": "alice",
+                    "updated_at": old,
+                    "memory_ids": ["m1"],
+                    "consolidation_state": "consolidating",
+                },
+                {
+                    "session_id": "retry",
+                    "user_id": "alice",
+                    "updated_at": old,
+                    "memory_ids": ["m2"],
+                    "consolidation_state": "consolidating",
+                },
+                {
+                    "session_id": "idle",
+                    "user_id": "alice",
+                    "updated_at": old,
+                    "memory_ids": ["m3"],
+                    "consolidation_state": "idle",
+                },
+            ]
+            consolidation.recover_session.side_effect = [
+                RuntimeError("recovery failed"),
+                False,
+            ]
+            result = MagicMock()
+            result.state = "consolidated"
+            consolidation.consolidate_session.return_value = result
+            service = MaintenanceService(
+                config=_make_config(),
+                fsck=_make_fsck_service(),
+                consolidation=consolidation,
+            )
+
+            await service._run_consolidation()
+
+            assert [
+                call.args[0]
+                for call in consolidation.consolidate_session.call_args_list
+            ] == ["retry", "idle"]
 
         asyncio.run(_run())
 
@@ -563,3 +670,58 @@ class TestMetricsAutofsck:
         assert totals["issues_found"] == 6
         assert totals["fixes_applied"] == 4
         assert totals["fixes_failed"] == 1
+
+
+def test_gc_uses_lightweight_metadata_scan_and_preserves_eligibility() -> None:
+    vector = MagicMock()
+    old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    vector.scroll_gc_metadata.return_value = [
+        {
+            "id": "eligible",
+            "metadata": {
+                "memory_layer": "raw",
+                "superseded_by": "new",
+                "artifacts": [],
+                "created_at_utc": old,
+            },
+        },
+        {
+            "id": "artifact",
+            "metadata": {
+                "memory_layer": "raw",
+                "superseded_by": "new",
+                "artifacts": [{"id": "a1"}],
+                "created_at_utc": old,
+            },
+        },
+    ]
+
+    assert gc_superseded_raw(vector, "filip") == {"deleted": 1}
+    vector.scroll_gc_metadata.assert_called_once_with(user_id="filip")
+    vector.scroll_with_vectors.assert_not_called()
+    vector.delete.assert_called_once_with("eligible")
+
+
+def test_gc_metadata_scan_requests_exact_fields_without_vectors() -> None:
+    from mnemory.storage.vector import VectorStore
+
+    point = MagicMock()
+    point.id = "memory-1"
+    point.payload = {"memory_layer": "raw"}
+    store = VectorStore.__new__(VectorStore)
+    store._client = MagicMock()
+    store._config = MagicMock()
+    store._config.vector.collection_name = "mnemory"
+    store._client.scroll.return_value = ([point], None)
+
+    assert store.scroll_gc_metadata(user_id="filip") == [
+        {"id": "memory-1", "metadata": {"memory_layer": "raw"}}
+    ]
+    kwargs = store._client.scroll.call_args.kwargs
+    assert kwargs["with_vectors"] is False
+    assert kwargs["with_payload"] == [
+        "memory_layer",
+        "superseded_by",
+        "artifacts",
+        "created_at_utc",
+    ]

@@ -2100,6 +2100,20 @@ class TestScrollWithVectorsPagination:
         assert len(results) == 520
         assert mock_client.scroll.call_count == 3
 
+    def test_short_page_with_cursor_continues(self):
+        """A short page does not end pagination when Qdrant returns a cursor."""
+        mock_client = MagicMock()
+        mock_client.scroll.side_effect = [
+            ([self._make_point("m1")], "cursor-1"),
+            ([self._make_point("m2")], None),
+        ]
+
+        store = self._make_vector_store(mock_client)
+        results = store.scroll_with_vectors(user_id="filip")
+
+        assert [result["id"] for result in results] == ["m1", "m2"]
+        assert mock_client.scroll.call_count == 2
+
     def test_empty_collection(self):
         """Empty collection returns empty list with a single scroll call."""
         mock_client = MagicMock()

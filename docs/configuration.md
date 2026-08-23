@@ -75,7 +75,7 @@ EMBED_BASE_URL=https://api.openai.com/v1
 | `INSTRUCTION_MODE` | `proactive` | LLM behavioral instructions: `passive`, `proactive`, or `personality` (see [Instruction Modes](#instruction-modes) below) |
 | `ENABLE_DELETE_ALL` | `false` | Enable the `delete_all_memories` tool (destructive, disabled by default) |
 | `ENABLE_METRICS` | `true` | Enable the `/metrics` Prometheus endpoint |
-| `METRICS_CACHE_TTL` | `60` | Cache TTL in seconds for Qdrant gauge aggregation on `/metrics` |
+| `METRICS_CACHE_TTL` | `600` | Cache TTL in seconds for Qdrant gauge aggregation on `/metrics` |
 | `MGMT_PORT` | | Management port for `/health` and `/metrics` (see [Management Port](#management-port) below) |
 | `MGMT_HOST` | (falls back to `MCP_HOST`) | Bind host for the management port |
 | `SERVER_BASE_URL` | | Base URL for generated download URLs (e.g., `https://mnemory.example.com`). If not set, URLs are relative paths. |

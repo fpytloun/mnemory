@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mnemory.config import Config
@@ -407,40 +407,49 @@ class ConsolidationService:
                 user_id, consolidation_state="consolidating"
             )
             for session in sessions:
-                sid = session.get("session_id", "")
-                consolidated_ids = session.get("consolidated_memory_ids")
-                if consolidated_ids:
-                    # Consolidated memories exist — resume supersede
-                    logger.info("Recovering session %s: resuming supersede", sid)
-                    memory_ids = session.get("memory_ids", [])
-                    raw_memories = self._fetch_raw_memories(memory_ids, user_id)
-                    artifact_ids = {
-                        m["id"]
-                        for m in raw_memories
-                        if (m.get("metadata") or {}).get("artifacts")
-                    }
-                    for mem in raw_memories:
-                        if mem["id"] not in artifact_ids:
-                            try:
-                                self._vector.update_metadata(
-                                    mem["id"],
-                                    {"superseded_by": consolidated_ids[0]},
-                                )
-                            except Exception:
-                                pass
-                    self._sessions.update_consolidation_state(
-                        sid,
-                        "consolidated",
-                        consolidated_memory_ids=consolidated_ids,
-                    )
-                else:
-                    # No consolidated memories — reset to idle
-                    logger.info("Recovering session %s: resetting to idle", sid)
-                    self._sessions.update_consolidation_state(sid, "idle")
+                self.recover_session(session)
                 recovered += 1
         except Exception:
             logger.exception("Recovery failed for user %s", user_id)
         return recovered
+
+    def recover_session(self, session: dict[str, Any]) -> bool:
+        """Recover one consolidating session.
+
+        Returns True when existing consolidation output completed recovery.
+        Returns False when the session was reset to idle for retry.
+        """
+        sid = session.get("session_id", "")
+        user_id = session.get("user_id", "")
+        consolidated_ids = session.get("consolidated_memory_ids")
+        if consolidated_ids:
+            logger.info("Recovering session %s: resuming supersede", sid)
+            memory_ids = session.get("memory_ids", [])
+            raw_memories = self._fetch_raw_memories(memory_ids, user_id)
+            artifact_ids = {
+                memory["id"]
+                for memory in raw_memories
+                if (memory.get("metadata") or {}).get("artifacts")
+            }
+            for memory in raw_memories:
+                if memory["id"] not in artifact_ids:
+                    try:
+                        self._vector.update_metadata(
+                            memory["id"],
+                            {"superseded_by": consolidated_ids[0]},
+                        )
+                    except Exception:
+                        pass
+            self._sessions.update_consolidation_state(
+                sid,
+                "consolidated",
+                consolidated_memory_ids=consolidated_ids,
+            )
+            return True
+
+        logger.info("Recovering session %s: resetting to idle", sid)
+        self._sessions.update_consolidation_state(sid, "idle")
+        return False
 
     def _fetch_raw_memories(self, memory_ids: list[str], user_id: str) -> list[dict]:
         """Fetch raw memories by IDs, filtering to only unsuperseded raw."""

@@ -7,6 +7,47 @@ from unittest.mock import MagicMock
 from mnemory.consolidation import ConsolidationService
 
 
+class TestGlobalConsolidationCandidateScan:
+    """Tests for maintenance candidate discovery across all users."""
+
+    def test_follows_all_cursors_and_requests_only_required_payload(self):
+        from mnemory.storage.vector import SessionSummaryStore
+
+        store = SessionSummaryStore.__new__(SessionSummaryStore)
+        store._client = MagicMock()
+
+        def point(index: int) -> MagicMock:
+            value = MagicMock()
+            value.payload = {
+                "session_id": f"s{index}",
+                "user_id": f"u{index % 2}",
+                "consolidation_state": "idle",
+            }
+            return value
+
+        store._client.scroll.side_effect = [
+            ([point(index) for index in range(120)], "cursor-1"),
+            ([point(index) for index in range(120, 263)], None),
+        ]
+
+        sessions = store.scan_consolidation_candidates()
+
+        assert len(sessions) == 263
+        assert store._client.scroll.call_count == 2
+        first = store._client.scroll.call_args_list[0].kwargs
+        second = store._client.scroll.call_args_list[1].kwargs
+        assert first["with_vectors"] is False
+        assert first["with_payload"] == [
+            "session_id",
+            "user_id",
+            "memory_ids",
+            "updated_at",
+            "consolidation_state",
+            "consolidated_memory_ids",
+        ]
+        assert second["offset"] == "cursor-1"
+
+
 def _make_service(vector_mock=None):
     """Create a ConsolidationService with mocked dependencies."""
     service = ConsolidationService.__new__(ConsolidationService)

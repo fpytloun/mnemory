@@ -30,7 +30,7 @@ By default, `/metrics` and `/health` are served on the main port with standard A
 
 ### Gauges (from Qdrant, cached)
 
-Refreshed on each scrape with a configurable cache TTL (`METRICS_CACHE_TTL`, default 60s). Aggregated by scrolling all Qdrant points.
+Refreshed asynchronously after the configurable cache TTL expires (`METRICS_CACHE_TTL`, default 600s). Stale values remain available during refresh.
 
 | Metric | Labels | Description |
 |---|---|---|

@@ -215,7 +215,7 @@ class ServerConfig:
         default_factory=lambda: _env_bool("ENABLE_METRICS", True)
     )
     metrics_cache_ttl: int = field(
-        default_factory=lambda: _env_int("METRICS_CACHE_TTL", 60)
+        default_factory=lambda: _env_int("METRICS_CACHE_TTL", 600)
     )
 
     # Thread pool size for MCP tool execution.

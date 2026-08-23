@@ -1146,7 +1146,42 @@ class VectorStore:
                     mem["vector"] = raw_vector
                 results.append(mem)
 
-            if next_offset is None or len(points) < _PAGE_SIZE:
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return results
+
+    def scroll_gc_metadata(self, *, user_id: str) -> list[dict[str, Any]]:
+        """Scroll lightweight metadata used by superseded raw-memory GC."""
+        scroll_filter = Filter(
+            must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        )
+        results: list[dict[str, Any]] = []
+        offset = None
+
+        while True:
+            points, next_offset = self._client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=scroll_filter,
+                limit=2048,
+                offset=offset,
+                with_payload=[
+                    "memory_layer",
+                    "superseded_by",
+                    "artifacts",
+                    "created_at_utc",
+                ],
+                with_vectors=False,
+            )
+            for point in points:
+                results.append(
+                    {
+                        "id": str(point.id),
+                        "metadata": dict(point.payload or {}),
+                    }
+                )
+            if next_offset is None:
                 break
             offset = next_offset
 
@@ -1743,6 +1778,46 @@ class SessionSummaryStore:
                             sessions.append(payload)
                 except (ValueError, TypeError):
                     pass
+
+        return sessions
+
+    def scan_consolidation_candidates(self) -> list[dict[str, Any]]:
+        """Scroll all idle and consolidating session summaries."""
+        sessions: list[dict[str, Any]] = []
+        offset = None
+        payload_fields = [
+            "session_id",
+            "user_id",
+            "memory_ids",
+            "updated_at",
+            "consolidation_state",
+            "consolidated_memory_ids",
+        ]
+        scroll_filter = Filter(
+            must=[
+                FieldCondition(
+                    key="consolidation_state",
+                    match=MatchAny(any=["idle", "consolidating"]),
+                )
+            ]
+        )
+
+        while True:
+            points, next_offset = self._client.scroll(
+                collection_name=self.COLLECTION,
+                scroll_filter=scroll_filter,
+                limit=self._LIST_BATCH_SIZE,
+                offset=offset,
+                with_payload=payload_fields,
+                with_vectors=False,
+            )
+            for point in points:
+                payload = dict(point.payload or {})
+                if payload.get("session_id") and payload.get("user_id"):
+                    sessions.append(payload)
+            if next_offset is None:
+                break
+            offset = next_offset
 
         return sessions
 

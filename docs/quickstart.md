@@ -11,6 +11,14 @@ mnemory picks up `OPENAI_API_KEY` from your environment automatically and stores
 uvx mnemory
 ```
 
+If `uvx` reports `No module named 'mcp.server.fastmcp'`, update uv. Older uv
+versions on Alpine can ignore mnemory's MCP v1 dependency constraint. Until
+you update uv, run:
+
+```bash
+uvx --with "mcp<2" mnemory
+```
+
 **Using Docker:**
 ```bash
 export OPENAI_API_KEY=sk-your-key

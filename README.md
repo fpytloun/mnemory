@@ -35,6 +35,14 @@ mnemory needs an OpenAI-compatible API key for LLM and embeddings. It picks up `
 uvx mnemory
 ```
 
+If `uvx` reports `No module named 'mcp.server.fastmcp'`, update uv. Older uv
+versions on Alpine can ignore mnemory's MCP v1 dependency constraint. Until
+you update uv, run:
+
+```bash
+uvx --with "mcp<2" mnemory
+```
+
 That's it. mnemory starts on `http://localhost:8050/mcp`, stores data in `~/.mnemory/`.
 
 Now connect your client — for **Claude Code**, add to your MCP config:

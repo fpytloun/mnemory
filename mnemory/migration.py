@@ -1015,6 +1015,391 @@ class BackfillOwnerIdMigration(Migration):
             offset = next_offset
 
 
+# ── Migration 005: Immutable memory revisions and operation journal ──────────
+
+
+class AddRevisionFoundationMigration(Migration):
+    """Create revision indexes and backfill legacy revision metadata."""
+
+    id = "005_add_revision_foundation"
+    description = (
+        "Create revision operation journal, indexes, and legacy revision metadata"
+    )
+
+    def __init__(self, collection_name: str):
+        self._collection_name = collection_name
+
+    def run(
+        self,
+        client: QdrantClient,
+        *,
+        progress: dict[str, Any] | None,
+        state_callback: Callable[[dict[str, Any]], None],
+        state: dict[str, Any],
+    ) -> None:
+        from qdrant_client.models import (
+            Distance,
+            Filter,
+            IsEmptyCondition,
+            PayloadField,
+            VectorParams,
+        )
+
+        from mnemory.revisions import OPERATIONS_COLLECTION
+
+        existing = {
+            collection.name for collection in client.get_collections().collections
+        }
+        if OPERATIONS_COLLECTION not in existing:
+            client.create_collection(
+                collection_name=OPERATIONS_COLLECTION,
+                vectors_config=VectorParams(size=1, distance=Distance.COSINE),
+            )
+
+        main_indexes = {
+            "lineage_id": "keyword",
+            "revision": "integer",
+            "revision_state": "keyword",
+            "supersedes": "keyword",
+            "derived_from": "keyword",
+            "source_session_id": "keyword",
+            "transition_token": "keyword",
+            "revision_operation_key_hash": "keyword",
+        }
+        operation_indexes = {
+            "user_id": "keyword",
+            "owner_id": "keyword",
+            "agent_id": "keyword",
+            "lineage_id": "keyword",
+            "operation_kind": "keyword",
+            "status": "keyword",
+            "idempotency_key_hash": "keyword",
+            "fsck_check_id": "keyword",
+            "fsck_issue_id": "keyword",
+            "session_id": "keyword",
+            "target_revision_ids": "keyword",
+            "affected_lineage_ids": "keyword",
+            "created_at_utc": "datetime",
+        }
+        session_indexes = {
+            "owner_id": "keyword",
+            "session_revision": "integer",
+            "consolidation_token": "keyword",
+        }
+        for collection_name, indexes in (
+            (self._collection_name, main_indexes),
+            (OPERATIONS_COLLECTION, operation_indexes),
+            (SESSIONS_COLLECTION, session_indexes),
+        ):
+            if (
+                collection_name not in existing
+                and collection_name != OPERATIONS_COLLECTION
+            ):
+                continue
+            for field_name, field_schema in indexes.items():
+                try:
+                    client.create_payload_index(
+                        collection_name=collection_name,
+                        field_name=field_name,
+                        field_schema=field_schema,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Revision index %s already exists on %s",
+                        field_name,
+                        collection_name,
+                    )
+
+        if SESSIONS_COLLECTION in existing:
+            session_offset = None
+            while True:
+                sessions, next_session_offset = client.scroll(
+                    collection_name=SESSIONS_COLLECTION,
+                    scroll_filter=Filter(
+                        must=[IsEmptyCondition(is_empty=PayloadField(key="owner_id"))]
+                    ),
+                    limit=256,
+                    offset=session_offset,
+                    with_payload=["user_id", "session_revision"],
+                    with_vectors=False,
+                )
+                for session in sessions:
+                    session_payload = dict(session.payload or {})
+                    session_user_id = session_payload.get("user_id")
+                    if not session_user_id:
+                        continue
+                    client.set_payload(
+                        collection_name=SESSIONS_COLLECTION,
+                        payload={
+                            "owner_id": session_user_id,
+                            "session_revision": int(
+                                session_payload.get("session_revision", 1)
+                            ),
+                        },
+                        points=[session.id],
+                        wait=True,
+                    )
+                if next_session_offset is None:
+                    break
+                session_offset = next_session_offset
+
+        offset = (progress or {}).get("offset")
+        processed = int((progress or {}).get("processed", 0) or 0)
+        updated = int((progress or {}).get("updated", 0) or 0)
+        warnings = int((progress or {}).get("warnings", 0) or 0)
+        start_time = time.monotonic()
+
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=Filter(
+                    must=[IsEmptyCondition(is_empty=PayloadField(key="revision_state"))]
+                ),
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            if not points:
+                break
+
+            for point in points:
+                payload = dict(point.payload or {})
+                point_id = str(point.id)
+                revision_state = "active"
+                provenance_quality = "exact"
+                provenance_warning = None
+
+                legacy_target_id = payload.get("superseded_by")
+                if (
+                    legacy_target_id
+                    and payload.get("memory_layer", "consolidated") == "raw"
+                ):
+                    target_result = client.retrieve(
+                        collection_name=self._collection_name,
+                        ids=[legacy_target_id],
+                        with_payload=True,
+                        with_vectors=False,
+                    )
+                    target_payload = (
+                        dict(target_result[0].payload or {}) if target_result else {}
+                    )
+                    same_owner = target_payload.get("owner_id") == payload.get(
+                        "owner_id"
+                    ) and target_payload.get("user_id") == payload.get("user_id")
+                    has_reverse_link = point_id in (
+                        target_payload.get("derived_from") or []
+                    )
+                    if same_owner and has_reverse_link:
+                        revision_state = "source"
+                        provenance_quality = "legacy_batch"
+                    else:
+                        provenance_quality = "legacy_batch"
+                        provenance_warning = "invalid_legacy_superseded_by"
+                        warnings += 1
+
+                revision_metadata: dict[str, Any] = {
+                    "lineage_id": point_id,
+                    "revision": 1,
+                    "revision_state": revision_state,
+                    "revision_created_at_utc": (
+                        payload.get("created_at_utc")
+                        or payload.get("created_at")
+                        or datetime.now(timezone.utc).isoformat()
+                    ),
+                    "validation_state": "unverified",
+                    "provenance_quality": provenance_quality,
+                }
+                if provenance_warning:
+                    revision_metadata["provenance_warning"] = provenance_warning
+                client.set_payload(
+                    collection_name=self._collection_name,
+                    payload=revision_metadata,
+                    points=[point.id],
+                    wait=True,
+                )
+                updated += 1
+
+            processed += len(points)
+            logger.info(
+                "Migration %s: processed=%d updated=%d warnings=%d elapsed=%.1fs",
+                self.id,
+                processed,
+                updated,
+                warnings,
+                time.monotonic() - start_time,
+            )
+            state[f"{self.id}_progress"] = {
+                "offset": str(next_offset) if next_offset else None,
+                "processed": processed,
+                "updated": updated,
+                "warnings": warnings,
+            }
+            state_callback(state)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+
+class AddValidationProjectionMigration(Migration):
+    """Add validation indexes and neutral projections for legacy memories."""
+
+    id = "006_add_validation_projection"
+    description = "Add evidence validation projection fields and indexes"
+
+    def __init__(self, collection_name: str):
+        self._collection_name = collection_name
+
+    def run(
+        self,
+        client: QdrantClient,
+        *,
+        progress: dict[str, Any] | None,
+        state_callback: Callable[[dict[str, Any]], None],
+        state: dict[str, Any],
+    ) -> None:
+        from qdrant_client.models import Filter, IsEmptyCondition, PayloadField
+
+        schemas = {
+            "source_kind": "keyword",
+            "validation_eligible": "bool",
+            "evidence_root_ids": "keyword",
+            "expires_at": "datetime",
+        }
+        for field, schema in schemas.items():
+            try:
+                client.create_payload_index(
+                    collection_name=self._collection_name,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception:
+                logger.debug("Validation index %s already exists", field)
+
+        offset = (progress or {}).get("offset")
+        processed = int((progress or {}).get("processed", 0) or 0)
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=self._collection_name,
+                scroll_filter=Filter(
+                    must=[
+                        IsEmptyCondition(is_empty=PayloadField(key="validation_count"))
+                    ]
+                ),
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            if not points:
+                break
+            client.set_payload(
+                collection_name=self._collection_name,
+                payload={
+                    "source_kind": "legacy_unknown",
+                    "validation_eligible": False,
+                    "evidence_root_ids": [],
+                    "validation_count": 0,
+                    "validation_strength": 0.0,
+                },
+                points=[point.id for point in points],
+                wait=True,
+            )
+            processed += len(points)
+            state[f"{self.id}_progress"] = {
+                "offset": str(next_offset) if next_offset else None,
+                "processed": processed,
+            }
+            state_callback(state)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+
+class ClassifyLegacyFailedSessionsMigration(Migration):
+    """Classify legacy failed sessions without retrying or changing state."""
+
+    id = "007_classify_legacy_failed_sessions"
+    description = "Classify failed sessions that predate failure diagnostics"
+
+    def run(
+        self,
+        client: QdrantClient,
+        *,
+        progress: dict[str, Any] | None,
+        state_callback: Callable[[dict[str, Any]], None],
+        state: dict[str, Any],
+    ) -> None:
+        from qdrant_client.models import (
+            FieldCondition,
+            Filter,
+            IsEmptyCondition,
+            MatchValue,
+            PayloadField,
+        )
+
+        collection = "_mnemory_sessions"
+        for field, schema in {
+            "legacy_failure": "bool",
+            "failure_class": "keyword",
+            "last_error_at": "datetime",
+            "retry_operation_token": "keyword",
+            "retry_claimant": "keyword",
+            "retry_lease_expires_at": "datetime",
+        }.items():
+            try:
+                client.create_payload_index(
+                    collection_name=collection,
+                    field_name=field,
+                    field_schema=schema,
+                )
+            except Exception:
+                logger.debug("Session failure index %s already exists", field)
+
+        offset = (progress or {}).get("offset")
+        processed = int((progress or {}).get("processed", 0) or 0)
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="consolidation_state",
+                            match=MatchValue(value="failed"),
+                        ),
+                        IsEmptyCondition(
+                            is_empty=PayloadField(key="failure_schema_version")
+                        ),
+                    ]
+                ),
+                limit=256,
+                offset=offset,
+                with_payload=False,
+                with_vectors=False,
+            )
+            if not points:
+                break
+            client.set_payload(
+                collection_name=collection,
+                payload={
+                    "failure_schema_version": 1,
+                    "legacy_failure": True,
+                    "failure_class": "legacy_unknown",
+                },
+                points=[point.id for point in points],
+                wait=True,
+            )
+            processed += len(points)
+            state[f"{self.id}_progress"] = {
+                "offset": str(next_offset) if next_offset else None,
+                "processed": processed,
+            }
+            state_callback(state)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+
 # ── Migration registry ───────────────────────────────────────────────
 
 
@@ -1032,4 +1417,7 @@ def get_migrations(
         CreateSessionsCollectionMigration(),
         AddMemoryLayerIndexMigration(collection_name),
         BackfillOwnerIdMigration(collection_name),
+        AddRevisionFoundationMigration(collection_name),
+        AddValidationProjectionMigration(collection_name),
+        ClassifyLegacyFailedSessionsMigration(),
     ]

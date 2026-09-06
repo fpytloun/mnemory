@@ -38,53 +38,9 @@ def gc_superseded_raw(
     *,
     retention_days: int = 30,
 ) -> dict[str, int]:
-    """Garbage-collect old superseded raw memories without artifacts.
-
-    Lifecycle management separate from fsck consistency checking.
-    Runs independently of fsck success/failure.
-
-    Deletes raw memories that:
-    - Have memory_layer=raw
-    - Have superseded_by set
-    - Were created more than retention_days ago
-    - Do NOT have artifacts
-    """
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
-
-    all_memories = vector.scroll_gc_metadata(user_id=user_id)
-
-    deleted = 0
-    for mem in all_memories:
-        meta = mem.get("metadata") or {}
-        if meta.get("memory_layer") != "raw":
-            continue
-        if not meta.get("superseded_by"):
-            continue
-        if meta.get("artifacts"):
-            continue
-        created = meta.get("created_at_utc", "")
-        if not created or created > cutoff:
-            continue
-        try:
-            mem_id = mem.get("id", "")
-            if mem_id:
-                vector.delete(mem_id)
-                deleted += 1
-        except Exception:
-            logger.warning(
-                "Failed to GC superseded memory %s",
-                mem.get("id"),
-                exc_info=True,
-            )
-
-    if deleted:
-        logger.info(
-            "GC: deleted %d superseded raw memories for user %s",
-            deleted,
-            user_id,
-        )
-
-    return {"deleted": deleted}
+    """Retain raw evidence. Kept as a compatibility no-op for old callers."""
+    del vector, user_id, retention_days
+    return {"deleted": 0}
 
 
 class MaintenanceService:
@@ -398,6 +354,7 @@ class MaintenanceService:
                         result = await asyncio.to_thread(
                             self._consolidation.consolidate_session,
                             session_id,
+                            session_record=session,
                         )
                         total_processed += 1
                         if result.state == "consolidated":
@@ -537,28 +494,6 @@ class MaintenanceService:
                     issues_found=issues_found,
                     fixes_applied=fixes_applied,
                     fixes_failed=fixes_failed,
-                )
-
-        # Run GC for superseded raw memories — runs independently of
-        # fsck success/failure.
-        retention_days = self._config.memory.consolidation_raw_retention_days
-        if retention_days > 0:
-            try:
-                gc_result = await asyncio.to_thread(
-                    gc_superseded_raw,
-                    self._fsck._vector,
-                    user_id,
-                    retention_days=retention_days,
-                )
-                if gc_result.get("deleted", 0) > 0:
-                    logger.info(
-                        "Maintenance: GC deleted %d superseded raw memories for user %s",
-                        gc_result["deleted"],
-                        user_id,
-                    )
-            except Exception:
-                logger.warning(
-                    "Maintenance: GC failed for user %s", user_id, exc_info=True
                 )
 
     # ── Helpers ──────────────────────────────────────────────────────

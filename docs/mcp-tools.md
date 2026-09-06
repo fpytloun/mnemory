@@ -20,8 +20,8 @@ mnemory exposes 17 tools via the [Model Context Protocol](https://modelcontextpr
 | `get_core_memories` | Load pinned + recent context at conversation start. Use for clients that inject MCP server instructions (e.g., Claude Code). |
 | `get_recent_memories` | Get recent activity from the last N days with scope filter (user/agent/all) |
 | `list_memories` | List all/filtered memories (supports `labels` and `memory_layer` filters) |
-| `update_memory` | Update content or metadata of existing memory (including `event_date` and `labels`) |
-| `delete_memory` | Delete a memory and its artifacts |
+| `update_memory` | Create an immutable successor revision. Supports `expected_revision` and `idempotency_key`. |
+| `delete_memory` | Retract by default. Set `privacy_erase=true` only to erase the lineage and artifacts. |
 | `delete_all_memories` | Delete all memories in scope |
 | `list_categories` | List categories with counts for discoverability |
 

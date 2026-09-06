@@ -1,0 +1,48 @@
+{
+  "protocol": "mnemory.trusted-evidence.v1",
+  "body": {
+    "version": 1,
+    "actor": {
+      "user_id": "user-1",
+      "owner_id": "owner-1"
+    },
+    "event": {
+      "id": "event-1",
+      "event_hash": "76e4ff98e2fae14ab4ec1ed4bbe734d40f764e08ac89f46c91655dcf10512f80",
+      "cognis_session_id": "session-1",
+      "conversation_id": "conversation-1",
+      "turn_id": "turn-1"
+    },
+    "messages": [
+      {
+        "role": "user",
+        "content": "I live in Prague."
+      }
+    ]
+  },
+  "canonical_request_bytes_utf8": "{\"body\":{\"actor\":{\"owner_id\":\"owner-1\",\"user_id\":\"user-1\"},\"event\":{\"cognis_session_id\":\"session-1\",\"conversation_id\":\"conversation-1\",\"event_hash\":\"76e4ff98e2fae14ab4ec1ed4bbe734d40f764e08ac89f46c91655dcf10512f80\",\"id\":\"event-1\",\"turn_id\":\"turn-1\"},\"messages\":[{\"content\":\"I live in Prague.\",\"role\":\"user\"}],\"version\":1},\"method\":\"POST\",\"route\":\"/api/evidence/remember/v1\"}",
+  "request_hash": "a38a964ae315e29bcd749d0e7b6fb435bf38d544ff2f68499847b5e85df7d982",
+  "claims": {
+    "iss": "cognis",
+    "aud": "mnemory",
+    "typ": "user_event",
+    "scope": "mnemory:evidence",
+    "evop": "remember",
+    "ver": 1,
+    "sub": "user-1",
+    "aow": "owner-1",
+    "evt": "event-1",
+    "event_hash": "76e4ff98e2fae14ab4ec1ed4bbe734d40f764e08ac89f46c91655dcf10512f80",
+    "request_hash": "a38a964ae315e29bcd749d0e7b6fb435bf38d544ff2f68499847b5e85df7d982",
+    "evidence_root": "41393ac4f3f1e7f14b6bc3b59292b94e55afc03877d9274db3f2449cd443e42f",
+    "cognis_session_id": "session-1",
+    "conversation_id": "conversation-1",
+    "turn_id": "turn-1",
+    "jti": "jti-1",
+    "iat": 1700000000,
+    "nbf": 1700000000,
+    "exp": 1700000060
+  },
+  "evidence_root": "41393ac4f3f1e7f14b6bc3b59292b94e55afc03877d9274db3f2449cd443e42f",
+  "expected_operation_id": "47b0e6df-930d-5d43-a03d-86407cab8b96"
+}

@@ -10,11 +10,15 @@ classification, and deduplication against existing memories.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
@@ -47,6 +51,7 @@ from mnemory.prompts import (
     parse_extraction_response,
     parse_remember_extraction_response,
 )
+from mnemory.revisions import RevisionConflictError, canonical_fingerprint
 from mnemory.sanitize import (
     CORE_MEMORIES_PREAMBLE,
     detect_injection_patterns,
@@ -57,6 +62,7 @@ from mnemory.sparse import SparseEmbeddingClient
 from mnemory.storage.artifact import ArtifactStore
 from mnemory.storage.vector import VectorStore
 from mnemory.ttl import (
+    apply_validation_and_decay_score,
     build_expiry_metadata,
     build_reinforcement_metadata,
     is_expired,
@@ -67,6 +73,9 @@ logger = logging.getLogger(__name__)
 
 # Max length for user_id and agent_id to prevent abuse
 _MAX_ID_LENGTH = 256
+_SUPPRESS_SENSITIVE_LLM_LOGS: ContextVar[bool] = ContextVar(
+    "suppress_sensitive_llm_logs", default=False
+)
 
 # Core context never includes provisional raw-layer memories.
 _CORE_EXCLUDE_LAYERS = ["raw"]
@@ -412,6 +421,12 @@ class MemoryService:
         # Initialized eagerly — fail fast at startup if model fails to load.
         sparse_model = config.memory.search_sparse_model
         self._sparse = SparseEmbeddingClient(model_name=sparse_model)
+        from mnemory.revisions import RevisionService
+
+        self.revisions = RevisionService(
+            self.vector,
+            sparse_embed=self._get_sparse_vector,
+        )
 
         # Warn if deprecated keyword weight is set
         if config.memory.search_keyword_weight > 0:
@@ -440,6 +455,12 @@ class MemoryService:
         session_timezone: str | None = None,
         labels: dict[str, Any] | None = None,
         _trusted: bool = False,
+        _memory_id: str | None = None,
+        _revision_metadata: dict[str, Any] | None = None,
+        _source_kind: str | None = None,
+        _source_event_id: str | None = None,
+        _validation_eligible: bool = False,
+        _mutation_guard: Callable[[], None] | None = None,
     ) -> dict:
         """Store a fast memory with metadata.
 
@@ -561,6 +582,9 @@ class MemoryService:
                 event_date=normalized_event_date,
                 session_timezone=session_timezone,
                 labels=validated_labels,
+                source_kind=_source_kind or "assistant_paraphrase",
+                source_event_id=_source_event_id,
+                validation_eligible=_validation_eligible,
             )
         else:
             result = self._add_direct(
@@ -576,6 +600,12 @@ class MemoryService:
                 ttl_days=ttl_days,
                 event_date=normalized_event_date,
                 labels=validated_labels,
+                memory_id=_memory_id,
+                revision_metadata=_revision_metadata,
+                source_kind=_source_kind or "assistant_paraphrase",
+                source_event_id=_source_event_id,
+                validation_eligible=_validation_eligible,
+                mutation_guard=_mutation_guard,
             )
 
         # Invalidate caches — new memory may affect core memories or categories
@@ -596,6 +626,8 @@ class MemoryService:
         session_timezone: str | None = None,
         context: str | None = None,
         labels: dict[str, Any] | None = None,
+        _trusted_evidence: bool = False,
+        _evidence_content: str | None = None,
     ) -> dict:
         """Process conversation content for memory extraction.
 
@@ -665,6 +697,8 @@ class MemoryService:
                 session_timezone=session_timezone,
                 context=context,
                 labels=validated_labels,
+                trusted_evidence=_trusted_evidence,
+                evidence_content=_evidence_content,
             )
 
         # Invalidate caches
@@ -699,6 +733,8 @@ class MemoryService:
         session_timezone: str | None,
         context: str | None,
         labels: dict[str, Any] | None = None,
+        trusted_evidence: bool = False,
+        evidence_content: str | None = None,
     ) -> dict:
         """Two-stage remember pipeline: extract then dedup.
 
@@ -763,6 +799,9 @@ class MemoryService:
             agent_id=agent_id,
             role=role,
             labels=labels,
+            source_content=evidence_content or content,
+            source_event_id=None,
+            trusted_evidence=trusted_evidence,
         )
 
         # 4. Update session context
@@ -792,6 +831,7 @@ class MemoryService:
                 self._session_summary_store.upsert(
                     session_id=session_id,
                     user_id=user_id,
+                    owner_id=owner_id,
                     agent_id=agent_id,
                     summary=current_summary,
                     new_memory_ids=stored_ids,
@@ -875,10 +915,12 @@ class MemoryService:
                 logger.exception("Remember extraction LLM call failed")
                 return [], "", False
 
-            logger.debug("Remember extraction response: %s", response_text)
+            if not _SUPPRESS_SENSITIVE_LLM_LOGS.get():
+                logger.debug("Remember extraction response: %s", response_text)
 
             facts, summary, store_artifact = parse_remember_extraction_response(
-                response_text
+                response_text,
+                silent=_SUPPRESS_SENSITIVE_LLM_LOGS.get(),
             )
 
             # Retry on parse failure: non-empty LLM response that produced
@@ -917,6 +959,9 @@ class MemoryService:
         agent_id: str | None,
         role: str | None,
         labels: dict[str, Any] | None = None,
+        source_content: str,
+        source_event_id: str | None,
+        trusted_evidence: bool,
     ) -> list[dict[str, Any]]:
         """Stage 2: Dedup extracted facts against stored memories and store.
 
@@ -1069,6 +1114,19 @@ class MemoryService:
             effective_role = (
                 role if role is not None else (action.get("role") or "user")
             )
+            validation_eligible = effective_role == "user" and trusted_evidence
+            source_kind = (
+                "raw_user_message"
+                if validation_eligible
+                else (
+                    "untrusted_user_message"
+                    if effective_role == "user"
+                    else "assistant_paraphrase"
+                )
+            )
+            source_fingerprint = canonical_fingerprint(
+                [owner_id, source_kind, source_event_id, source_content]
+            )
 
             # Pass labels through explicit_fields so they are inherited
             # by all extracted facts (labels bypass LLM entirely)
@@ -1088,6 +1146,10 @@ class MemoryService:
                     vector_map=vector_map,
                     event_date=None,
                     memory_layer="raw",
+                    source_kind=source_kind,
+                    source_fingerprint=source_fingerprint,
+                    evidence_root_id=source_fingerprint,
+                    validation_eligible=validation_eligible,
                 )
                 if result_entry:
                     results.append(result_entry)
@@ -1117,7 +1179,9 @@ class MemoryService:
             collector.record_remember_extraction(
                 user_id=user_id,
                 facts_extracted=len(facts),
-                facts_stored=len(results),
+                facts_stored=sum(
+                    result.get("event") in {"ADD", "UPDATE"} for result in results
+                ),
                 dedup_actions=dedup_counts,
             )
 
@@ -1131,65 +1195,45 @@ class MemoryService:
         """Make a single LLM call for dedup decisions.
 
         Returns list of action dicts compatible with _execute_action.
-        Falls back to ADD-all on LLM failure.
+        Retries once and fails closed if output is missing or invalid.
         """
         messages, json_schema, id_mapping = build_dedup_prompt(facts_with_candidates)
 
-        try:
-            response_text = self._llm.generate(
-                messages,
-                json_schema=json_schema,
-                operation="remember_dedup",
+        for attempt in range(2):
+            try:
+                response_text = self._llm.generate(
+                    messages,
+                    json_schema=json_schema,
+                    operation="remember_dedup",
+                )
+            except Exception:
+                logger.exception(
+                    "Remember dedup LLM call failed (attempt %d/2)", attempt + 1
+                )
+                continue
+
+            if not _SUPPRESS_SENSITIVE_LLM_LOGS.get():
+                logger.debug("Remember dedup response: %s", response_text)
+            actions, decided_indices = parse_dedup_response(
+                response_text,
+                id_mapping,
+                facts,
+                silent=_SUPPRESS_SENSITIVE_LLM_LOGS.get(),
             )
-        except Exception:
-            logger.exception("Remember dedup LLM call failed, falling back to ADD-all")
-            return [
-                {
-                    "text": f["text"],
-                    "action": "ADD",
-                    "target_id": None,
-                    "old_memory": None,
-                    "memory_type": f["memory_type"],
-                    "categories": f["categories"],
-                    "importance": f["importance"],
-                    "pinned": f["pinned"],
-                    "event_date": f.get("event_date"),
-                    # Carry per-fact role through the action dict (auto mode)
-                    "role": f.get("role"),
-                }
-                for f in facts
-            ]
+            if decided_indices == set(range(len(facts))):
+                return actions
+            if not _SUPPRESS_SENSITIVE_LLM_LOGS.get():
+                logger.warning(
+                    "Remember dedup output incomplete (attempt %d/2): decided %d of %d",
+                    attempt + 1,
+                    len(decided_indices),
+                    len(facts),
+                )
 
-        logger.debug("Remember dedup response: %s", response_text)
-
-        actions, decided_indices = parse_dedup_response(
-            response_text, id_mapping, facts
+        logger.error(
+            "Remember dedup failed closed after 2 attempts; no memory mutations executed"
         )
-
-        # For facts not mentioned in the dedup response, default to ADD
-        for i, f in enumerate(facts):
-            if i not in decided_indices:
-                logger.debug(
-                    "Remember dedup: fact %d not in response, defaulting to ADD",
-                    i,
-                )
-                actions.append(
-                    {
-                        "text": f["text"],
-                        "action": "ADD",
-                        "target_id": None,
-                        "old_memory": None,
-                        "memory_type": f["memory_type"],
-                        "categories": f["categories"],
-                        "importance": f["importance"],
-                        "pinned": f["pinned"],
-                        "event_date": f.get("event_date"),
-                        # Carry per-fact role through the action dict (auto mode)
-                        "role": f.get("role"),
-                    }
-                )
-
-        return actions
+        raise RuntimeError("Deduplication failed after 2 attempts; no memories changed")
 
     def _update_session_context(
         self,
@@ -1290,6 +1334,9 @@ class MemoryService:
         session_timezone: str | None = None,
         context: str | None = None,
         labels: dict[str, Any] | None = None,
+        source_kind: str = "assistant_paraphrase",
+        source_event_id: str | None = None,
+        validation_eligible: bool = False,
     ) -> dict:
         """Add memory with LLM-driven extraction, classification, and dedup.
 
@@ -1403,10 +1450,15 @@ class MemoryService:
             logger.exception("LLM extraction call failed")
             return {"error": True, "message": "Memory extraction failed"}
 
-        logger.debug("Extraction LLM response: %s", response_text)
+        if not _SUPPRESS_SENSITIVE_LLM_LOGS.get():
+            logger.debug("Extraction LLM response: %s", response_text)
 
         # 5. Parse response and execute actions
-        actions, store_artifact = parse_extraction_response(response_text, id_mapping)
+        actions, store_artifact = parse_extraction_response(
+            response_text,
+            id_mapping,
+            silent=_SUPPRESS_SENSITIVE_LLM_LOGS.get(),
+        )
 
         logger.debug(
             "Parsed %d actions: %s (store_artifact=%s)",
@@ -1434,6 +1486,9 @@ class MemoryService:
             vector_map = {}
 
         results = []
+        source_fingerprint = canonical_fingerprint(
+            [owner_id, source_kind, source_event_id, content]
+        )
         for action in actions:
             try:
                 result_entry = self._execute_action(
@@ -1446,6 +1501,10 @@ class MemoryService:
                     explicit_fields=explicit_fields,
                     vector_map=vector_map,
                     event_date=event_date,
+                    source_kind=source_kind,
+                    source_fingerprint=source_fingerprint,
+                    evidence_root_id=source_fingerprint,
+                    validation_eligible=validation_eligible,
                 )
                 if result_entry:
                     results.append(result_entry)
@@ -1645,8 +1704,12 @@ class MemoryService:
         vector_map: dict[str, list[float]],
         event_date: str | None = None,
         memory_layer: str = "consolidated",
+        source_kind: str = "assistant_paraphrase",
+        source_fingerprint: str | None = None,
+        evidence_root_id: str | None = None,
+        validation_eligible: bool = False,
     ) -> dict[str, Any] | None:
-        """Execute a single memory action (ADD, UPDATE, or DELETE)."""
+        """Execute one validated ADD, UPDATE, CONFIRM, or SKIP action."""
         owner_id = owner_id or user_id
         # Guard: role must be resolved to a concrete value before execution.
         # The remember pipeline resolves per-fact roles before calling this.
@@ -1656,8 +1719,22 @@ class MemoryService:
                 f"'user' or 'assistant', not None or other values"
             )
 
-        act = action["action"]
+        act = str(action.get("action", "")).upper()
+        if act not in {"ADD", "UPDATE", "CONFIRM", "SKIP"}:
+            logger.warning("Rejected unknown inferred action %r", act)
+            return None
         text = action["text"]
+        source_fingerprint = source_fingerprint or canonical_fingerprint(
+            [owner_id, source_kind, text]
+        )
+        evidence_root_id = evidence_root_id or source_fingerprint
+
+        if act == "SKIP":
+            return {
+                "id": action.get("target_id"),
+                "memory": text,
+                "event": "SKIP",
+            }
 
         # Apply explicit overrides — caller-provided fields take precedence
         mem_type = explicit_fields.get("memory_type", action["memory_type"])
@@ -1696,6 +1773,16 @@ class MemoryService:
                 "artifacts": [],
                 "created_at_utc": datetime.now(timezone.utc).isoformat(),
                 "memory_layer": memory_layer,
+                "source_kind": source_kind,
+                "source_fingerprint": source_fingerprint,
+                "fact_hash": self.revisions._normalized_fact_hash(text),
+                "validation_eligible": validation_eligible,
+                "evidence_root_ids": (
+                    [evidence_root_id] if validation_eligible else []
+                ),
+                "consumed_evidence_root_ids": [],
+                "validation_count": 0,
+                "validation_strength": 0.0,
             }
             if effective_event_date is not None:
                 metadata["event_date"] = effective_event_date
@@ -1719,105 +1806,477 @@ class MemoryService:
             return {"id": memory_id, "memory": text, "event": "ADD"}
 
         elif act == "UPDATE":
-            target_id = action["target_id"]
-            vector = vector_map.get(text)
-            if vector is None:
-                vector = self.vector.embedding.embed(text)
-
-            # Fetch existing memory to preserve metadata we don't want to lose
+            target_id = action.get("target_id")
+            if not isinstance(target_id, str) or not target_id:
+                logger.warning("Rejected UPDATE without a candidate target")
+                return None
             existing = self.vector.get_by_id(target_id)
-            if existing is None:
+            if (
+                existing is not None
+                and not isinstance(existing, dict)
+                and action.get("_candidate_validated")
+            ):
+                existing = {"id": target_id, "metadata": {}}
+            if not self._is_valid_inferred_target(
+                existing,
+                target_id=target_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                agent_id=agent_id,
+            ):
                 logger.warning(
-                    "UPDATE target %s not found, converting to ADD", target_id
+                    "Rejected stale or inaccessible UPDATE target %s", target_id
                 )
-                # Fall through to ADD instead
-                action_copy = dict(action)
-                action_copy["action"] = "ADD"
-                action_copy["target_id"] = None
-                return self._execute_action(
-                    action_copy,
-                    user_id=user_id,
-                    owner_id=owner_id,
-                    agent_id=agent_id,
-                    role=role,
-                    ttl_days=ttl_days,
-                    explicit_fields=explicit_fields,
-                    vector_map=vector_map,
-                    event_date=event_date,
-                    memory_layer=memory_layer,
-                )
+                return None
 
-            # Build updated metadata — preserve existing, override with new
             existing_meta = existing.get("metadata") or {}
-            metadata_update = {
+            changes = {
+                "data": text,
                 "memory_type": mem_type,
                 "categories": cats or [],
                 "importance": imp,
                 "pinned": pin,
-                # Always write role explicitly so that updating a memory
-                # with a different role (e.g. user→assistant) takes effect.
-                # update_metadata() uses Qdrant set_payload (patch semantics)
-                # and would silently preserve the old role if omitted.
                 "role": role,
-                # Write memory_layer on UPDATE to tag legacy memories that
-                # were created before the two-layer system. Without this,
-                # legacy memories touched by remember would stay untagged.
                 "memory_layer": memory_layer,
+                "source_kind": source_kind,
+                "source_fingerprint": source_fingerprint,
+                "fact_hash": self.revisions._normalized_fact_hash(text),
+                "validation_eligible": validation_eligible,
+                "evidence_root_ids": (
+                    [evidence_root_id] if validation_eligible else []
+                ),
+                "validation_count": 0,
+                "validation_strength": 0.0,
+                "validation_state": "unverified",
+                "last_validated_at": None,
             }
-            # Preserve or update event_date
-            # Priority: caller-provided > LLM-extracted > existing
             if effective_event_date is not None:
-                metadata_update["event_date"] = effective_event_date
+                changes["event_date"] = effective_event_date
             elif existing_meta.get("event_date"):
-                metadata_update["event_date"] = existing_meta["event_date"]
-            # Recalculate TTL based on new memory_type
-            ttl_meta = build_expiry_metadata(ttl_days, mem_type, self._config.memory)
-            metadata_update.update(ttl_meta)
-
-            # Preserve artifacts from existing memory
-            metadata_update["artifacts"] = existing_meta.get("artifacts", [])
-            # Merge labels: caller-provided labels win on key conflicts,
-            # existing labels preserved for keys not in caller's dict
+                changes["event_date"] = existing_meta["event_date"]
+            changes.update(
+                build_expiry_metadata(ttl_days, mem_type, self._config.memory)
+            )
             existing_labels = existing_meta.get("labels", {})
             caller_labels = explicit_fields.get("labels")
             if caller_labels is not None:
                 merged_labels = {**existing_labels, **caller_labels}
                 if merged_labels:
-                    metadata_update["labels"] = merged_labels
+                    changes["labels"] = merged_labels
             elif existing_labels:
-                metadata_update["labels"] = existing_labels
-            metadata_update["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-
-            # Update content + re-embed via full point replacement
-            # (preserves all payload fields we set)
-            self.vector.update_content(
+                changes["labels"] = existing_labels
+            result = self.revisions.revise(
                 target_id,
-                text,
-                vector=vector,
-                sparse_vector=self._get_sparse_vector(text),
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=agent_id,
+                changes=changes,
+                idempotency_key=f"remember:{canonical_fingerprint(changes)}",
+                operation_kind="remember_update",
+                actor_kind="remember",
             )
-            # Then update metadata
-            self.vector.update_metadata(target_id, metadata_update)
-
             return {
-                "id": target_id,
+                "id": result["revision_id"],
                 "memory": text,
                 "event": "UPDATE",
                 "previous_memory": action.get("old_memory"),
+                "lineage_id": result["lineage_id"],
+                "revision": result["revision"],
             }
 
-        elif act == "DELETE":
-            target_id = action["target_id"]
-            # Clean up artifacts with reference checking
-            try:
-                self._cleanup_memory_artifacts(user_id, target_id)
-            except Exception:
-                logger.warning("Failed to delete artifacts for %s", target_id)
+        elif act == "CONFIRM":
+            target_id = action.get("target_id")
+            if (
+                not self._config.memory.validation_enabled
+                or not validation_eligible
+                or not isinstance(target_id, str)
+                or not target_id
+            ):
+                return {"id": target_id, "memory": text, "event": "SKIP"}
+            existing = self.vector.get_by_id(target_id)
+            if (
+                existing is not None
+                and not isinstance(existing, dict)
+                and action.get("_candidate_validated")
+            ):
+                existing = {"id": target_id, "metadata": {}}
+            if not self._is_valid_inferred_target(
+                existing,
+                target_id=target_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                agent_id=agent_id,
+            ):
+                logger.warning(
+                    "Rejected stale or inaccessible CONFIRM target %s", target_id
+                )
+                return {"id": target_id, "memory": text, "event": "SKIP"}
+            result = self.revisions.confirm(
+                target_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=agent_id,
+                evidence_root_id=evidence_root_id,
+                source_kind=source_kind,
+                source_fingerprint=source_fingerprint,
+                ttl_multiplier=self._config.memory.validation_ttl_multiplier,
+                max_score_roots=self._config.memory.validation_max_score_roots,
+            )
+            from mnemory.metrics import get_collector
 
-            self.vector.delete(target_id)
-            return {"id": target_id, "memory": text, "event": "DELETE"}
+            collector = get_collector()
+            if collector:
+                collector.record_confirmation(
+                    "replayed" if result.get("replayed") else "accepted"
+                )
+            return {
+                "id": target_id,
+                "memory": text,
+                "event": "CONFIRM" if result["status"] == "confirmed" else "SKIP",
+                "lineage_id": result["lineage_id"],
+                "revision": result["revision"],
+                "operation_id": result.get("operation_id"),
+                "replayed": result.get("replayed", False),
+            }
 
         return None
+
+    @staticmethod
+    def _is_valid_inferred_target(
+        memory: dict[str, Any] | None,
+        *,
+        target_id: str,
+        user_id: str,
+        owner_id: str,
+        agent_id: str | None,
+    ) -> bool:
+        """Validate a model-selected target before a revision mutation."""
+        if not memory or memory.get("id") != target_id:
+            return False
+        metadata = memory.get("metadata") or {}
+        if metadata.get("revision_state", "active") != "active":
+            return False
+        if memory.get("user_id") not in (None, user_id):
+            return False
+        target_owner = memory.get("owner_id") or memory.get("user_id")
+        if target_owner is not None and target_owner != owner_id:
+            return False
+        target_agent = memory.get("agent_id")
+        return target_agent is None or target_agent == agent_id
+
+    def plan_evidence(
+        self,
+        claims: list[dict[str, Any]],
+        *,
+        user_id: str,
+        owner_id: str | None = None,
+        evidence_root_id: str,
+        content: str | None = None,
+    ) -> dict[str, Any]:
+        """Return a read-only exact-equivalence CONFIRM/SKIP evidence plan."""
+        owner_id = owner_id or user_id
+        if content is not None:
+            claims = self._extract_evidence_claims(
+                content,
+                user_id=user_id,
+                owner_id=owner_id,
+            )
+        targets = self.revisions.plan_evidence(
+            claims,
+            user_id=user_id,
+            owner_id=owner_id,
+            evidence_root_id=evidence_root_id,
+            semantic_equivalence=(
+                self._evidence_semantic_equivalence if content is not None else None
+            ),
+        )
+        return {
+            "protocol": "mnemory.trusted-evidence.v1",
+            "user_id": user_id,
+            "owner_id": owner_id,
+            "evidence_root_id": evidence_root_id,
+            "targets": targets,
+        }
+
+    def _extract_evidence_claims(
+        self,
+        content: str,
+        *,
+        user_id: str,
+        owner_id: str,
+    ) -> list[dict[str, Any]]:
+        """Run user-only extraction and read-only dedup for evidence planning."""
+        token = _SUPPRESS_SENSITIVE_LLM_LOGS.set(True)
+        try:
+            facts, _, _ = self._remember_extract(
+                content,
+                role="user",
+                session_context=None,
+                available_categories=self._get_available_categories(user_id),
+                max_memory_length=self._config.memory.max_memory_length,
+                session_timezone=None,
+                context=None,
+            )
+        finally:
+            _SUPPRESS_SENSITIVE_LLM_LOGS.reset(token)
+        facts = facts[:32]
+        if not facts:
+            return [{"candidate_id": None}]
+        fact_candidates: list[dict[str, Any]] = []
+        for fact, vector in zip(
+            facts,
+            self.vector.embedding.embed_batch([fact["text"] for fact in facts]),
+        ):
+            candidates = self.vector.search_similar(
+                vector,
+                user_id=user_id,
+                owner_id=owner_id,
+                subject_user_id=user_id,
+                shared_only=True,
+                limit=10,
+            )
+            fact_candidates.append(
+                {
+                    "index": len(fact_candidates),
+                    "assertion_text": fact["text"],
+                    "source_text": content,
+                    "candidate_ids": [
+                        item.get("id") or item.get("candidate_id")
+                        for item in candidates
+                        if item.get("id") or item.get("candidate_id")
+                    ],
+                    "candidate_hashes": {
+                        (
+                            item.get("id") or item.get("candidate_id")
+                        ): self._evidence_candidate_hashes(item)
+                        for item in candidates
+                        if item.get("id") or item.get("candidate_id")
+                    },
+                }
+            )
+        return [
+            {
+                "candidate_ids": item["candidate_ids"],
+                "source_text": item["source_text"],
+                "assertion_text": item["assertion_text"],
+                "candidate_hashes": item["candidate_hashes"],
+                "claim_count": 1,
+            }
+            for item in fact_candidates
+        ]
+
+    def _evidence_candidate_hashes(self, candidate: dict[str, Any]) -> dict[str, str]:
+        """Derive hashes from the flattened similarity result."""
+        text = candidate.get("text") or candidate.get("memory") or ""
+        content_hash = candidate.get("hash") or candidate.get("content_hash")
+        if not isinstance(content_hash, str):
+            content_hash = hashlib.sha256(str(text).encode("utf-8")).hexdigest()
+        fact_hash = candidate.get("fact_hash")
+        if not isinstance(fact_hash, str):
+            fact_hash = self.revisions._normalized_fact_hash(str(text))
+        return {"content_hash": content_hash, "fact_hash": fact_hash}
+
+    def _evidence_semantic_equivalence(
+        self, source_text: str, target_text: str, assertion_text: str | None
+    ) -> bool:
+        """Require a dedicated full bidirectional semantic-equivalence decision."""
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Compare one signed user source with one complete stored "
+                    'assertion. Return JSON only: {"equivalent": boolean}. '
+                    "First require the signed source to entail the extracted "
+                    "assertion. Then require bidirectional equivalence between "
+                    "that assertion and the complete candidate. Do not require "
+                    "the candidate to entail unrelated clauses in the source. "
+                    "Reject negation, attribution changes, and partial "
+                    "multi-claim support."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "signed_source": source_text,
+                        "extracted_assertion_hint": assertion_text,
+                        "complete_candidate_assertion": target_text,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            },
+        ]
+        try:
+            response = self._llm.generate(
+                messages,
+                json_schema={
+                    "type": "object",
+                    "properties": {"equivalent": {"type": "boolean"}},
+                    "required": ["equivalent"],
+                    "additionalProperties": False,
+                },
+                operation="evidence_semantic_equivalence",
+            )
+            parsed = parse_json_response(response)
+            return isinstance(parsed, dict) and parsed.get("equivalent") is True
+        except Exception:
+            return False
+
+    def seal_evidence_plan(
+        self,
+        plan: dict[str, Any],
+        *,
+        request_fingerprint: str,
+    ) -> dict[str, Any]:
+        """Durably seal a previously produced read-only evidence plan."""
+        return self.revisions.operations.seal_evidence_plan(
+            protocol=str(plan.get("protocol", "mnemory.trusted-evidence.v1")),
+            user_id=str(plan["user_id"]),
+            owner_id=str(plan["owner_id"]),
+            evidence_root_id=str(plan["evidence_root_id"]),
+            request_fingerprint=request_fingerprint,
+            targets=list(plan["targets"]),
+        )
+
+    def apply_evidence_plan(
+        self,
+        operation_id: str,
+        *,
+        request_fingerprint: str,
+        epoch: int,
+        nonce: str,
+        user_id: str,
+        owner_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply only the exact sealed targets and resume from checkpoints."""
+        owner_id = owner_id or user_id
+        operation = self.revisions.operations.get_evidence_plan(operation_id)
+        if operation is None:
+            raise ValueError(f"Evidence plan not found: {operation_id}")
+        if (
+            operation.get("user_id") != user_id
+            or operation.get("owner_id") != owner_id
+            or operation.get("request_fingerprint") != request_fingerprint
+        ):
+            raise ValueError("Cannot access evidence plan")
+        if operation.get("status") != "claimed":
+            raise RevisionConflictError("Evidence plan is not actively claimed")
+        self.revisions.operations.verify_evidence_claim(
+            operation_id,
+            request_fingerprint=request_fingerprint,
+            epoch=epoch,
+            nonce=nonce,
+        )
+        checkpoints = {
+            int(item["ordinal"]): item
+            for item in operation.get("checkpoints", [])
+            if isinstance(item, dict) and isinstance(item.get("ordinal"), int)
+        }
+        results = list(operation.get("checkpoints", []))
+        for target in operation["targets"]:
+            ordinal = int(target["ordinal"])
+            if ordinal in checkpoints:
+                continue
+            self.revisions.operations.verify_evidence_claim(
+                operation_id,
+                request_fingerprint=request_fingerprint,
+                epoch=epoch,
+                nonce=nonce,
+            )
+            checkpoint: dict[str, Any] = {
+                "ordinal": ordinal,
+                "target_id": target.get("target_id"),
+                "action": target.get("action", "SKIP"),
+                "status": "skipped",
+            }
+            if target.get("action") == "CONFIRM":
+                try:
+                    if not self.revisions.verify_evidence_target(
+                        target,
+                        user_id=user_id,
+                        owner_id=owner_id,
+                    ):
+                        raise RevisionConflictError("Sealed evidence target is stale")
+                    self.revisions.operations.verify_evidence_claim(
+                        operation_id,
+                        request_fingerprint=request_fingerprint,
+                        epoch=epoch,
+                        nonce=nonce,
+                    )
+                    # Qdrant cannot atomically fence an operation point and a
+                    # memory point. The deterministic parent+ordinal child
+                    # operation and the target revision CAS are authoritative:
+                    # takeover workers converge on this exact target/root,
+                    # never on a newly broadened plan.
+                    confirmed = self.revisions.confirm(
+                        str(target["target_id"]),
+                        user_id=user_id,
+                        owner_id=owner_id,
+                        session_agent_id=None,
+                        evidence_root_id=operation["evidence_root_id"],
+                        source_kind="evidence_plan",
+                        source_fingerprint=request_fingerprint,
+                        ttl_multiplier=getattr(
+                            self._config.memory, "validation_ttl_multiplier", 1.0
+                        ),
+                        max_score_roots=getattr(
+                            self._config.memory, "validation_max_score_roots", 3
+                        ),
+                        idempotency_key=f"{operation_id}:{ordinal}",
+                        expected_revision_id=str(target["revision_id"]),
+                        expected_lineage_id=str(target["lineage_id"]),
+                        expected_content_hash=str(target["content_hash"]),
+                        expected_fact_hash=str(target["fact_hash"]),
+                        parent_operation_id=operation_id,
+                        parent_epoch=epoch,
+                        parent_nonce=nonce,
+                    )
+                    checkpoint.update(
+                        status="confirmed"
+                        if confirmed["status"] == "confirmed"
+                        else "skipped",
+                        result=confirmed,
+                    )
+                except RevisionConflictError:
+                    self.revisions.operations.verify_evidence_claim(
+                        operation_id,
+                        request_fingerprint=request_fingerprint,
+                        epoch=epoch,
+                        nonce=nonce,
+                    )
+                    checkpoint["reason"] = "stale_target"
+            results.append(checkpoint)
+            results.sort(key=lambda item: int(item["ordinal"]))
+            self.revisions.operations.verify_evidence_claim(
+                operation_id,
+                request_fingerprint=request_fingerprint,
+                epoch=epoch,
+                nonce=nonce,
+            )
+            self.revisions.operations.checkpoint_evidence_plan(
+                operation_id,
+                request_fingerprint=request_fingerprint,
+                epoch=epoch,
+                nonce=nonce,
+                checkpoints=results,
+            )
+        committed = self.revisions.operations.commit_evidence_plan(
+            operation_id,
+            request_fingerprint=request_fingerprint,
+            epoch=epoch,
+            nonce=nonce,
+            result={
+                "status": (
+                    "skipped"
+                    if all(item.get("status") == "skipped" for item in results)
+                    else "committed"
+                ),
+                "checkpoints": results,
+            },
+        )
+        return committed
 
     def _maybe_create_auto_artifact(
         self,
@@ -1920,6 +2379,12 @@ class MemoryService:
         ttl_days: int | None,
         event_date: str | None = None,
         labels: dict[str, Any] | None = None,
+        memory_id: str | None = None,
+        revision_metadata: dict[str, Any] | None = None,
+        source_kind: str = "assistant_paraphrase",
+        source_event_id: str | None = None,
+        validation_eligible: bool = False,
+        mutation_guard: Callable[[], None] | None = None,
     ) -> dict:
         """Add memory directly without LLM inference (infer=False path).
 
@@ -2006,6 +2471,23 @@ class MemoryService:
             "artifacts": [],
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
             "memory_layer": "consolidated",
+            "source_kind": source_kind,
+            "source_fingerprint": canonical_fingerprint(
+                [owner_id, source_kind, source_event_id, content]
+            ),
+            "validation_eligible": validation_eligible,
+            "evidence_root_ids": (
+                [
+                    canonical_fingerprint(
+                        [owner_id, source_kind, source_event_id, content]
+                    )
+                ]
+                if validation_eligible
+                else []
+            ),
+            "consumed_evidence_root_ids": [],
+            "validation_count": 0,
+            "validation_strength": 0.0,
         }
         if event_date is not None:
             metadata["event_date"] = event_date
@@ -2015,6 +2497,8 @@ class MemoryService:
         # Add TTL metadata
         ttl_meta = build_expiry_metadata(ttl_days, memory_type, self._config.memory)
         metadata.update(ttl_meta)
+        if revision_metadata:
+            metadata.update(revision_metadata)
 
         # Auto-artifact for oversized content (infer=False path)
         max_len = self._config.memory.max_memory_length
@@ -2024,6 +2508,8 @@ class MemoryService:
         if len(content) > max_len:
             # Save full content as artifact, truncate memory text
             try:
+                if mutation_guard is not None:
+                    mutation_guard()
                 art_meta = self.artifact.save(
                     user_id=user_id,
                     content=content,
@@ -2061,6 +2547,9 @@ class MemoryService:
 
         # Embed and store
         vector = self.vector.embedding.embed(store_content)
+        sparse_vector = self._get_sparse_vector(store_content)
+        if mutation_guard is not None:
+            mutation_guard()
         memory_id = self.vector.insert(
             text=store_content,
             vector=vector,
@@ -2069,7 +2558,8 @@ class MemoryService:
             agent_id=agent_id,
             metadata=metadata,
             role=role,
-            sparse_vector=self._get_sparse_vector(store_content),
+            sparse_vector=sparse_vector,
+            memory_id=memory_id,
         )
 
         response: dict[str, Any] = {
@@ -2107,9 +2597,17 @@ class MemoryService:
             imp_value = IMPORTANCE_WEIGHTS.get(imp_level, 0.4)
             mem["score"] = round(mem.get("score", 0) + importance_weight * imp_value, 4)
 
-        # Layer-aware scoring: penalize raw and superseded memories
+        memories.sort(key=lambda m: m.get("score", 0), reverse=True)
+        return memories
+
+    def _apply_layer_penalties(self, memories: list[dict]) -> list[dict]:
+        """Apply raw and superseded score penalties for every search mode."""
         raw_penalty = self._config.memory.recall_raw_penalty
         superseded_penalty = self._config.memory.recall_superseded_penalty
+        raw_penalty = raw_penalty if isinstance(raw_penalty, (int, float)) else 0.0
+        superseded_penalty = (
+            superseded_penalty if isinstance(superseded_penalty, (int, float)) else 0.0
+        )
         if raw_penalty > 0 or superseded_penalty > 0:
             for mem in memories:
                 meta = mem.get("metadata") or {}
@@ -2211,6 +2709,29 @@ class MemoryService:
         if query_sparse_vector is None:
             query_sparse_vector = self._get_sparse_vector(query)
 
+        penalties_enabled = any(
+            isinstance(value, (int, float)) and value > 0
+            for value in (
+                self._config.memory.recall_raw_penalty,
+                self._config.memory.recall_superseded_penalty,
+            )
+        )
+        reranking_enabled = (
+            penalties_enabled
+            or getattr(self._config.memory, "validation_enabled", False) is True
+            or getattr(self._config.memory, "slow_decay_enabled", False) is True
+        )
+        configured_multiplier = getattr(
+            self._config.memory, "slow_decay_candidate_multiplier", 3
+        )
+        candidate_multiplier = max(
+            configured_multiplier if isinstance(configured_multiplier, int) else 3,
+            1,
+        )
+        retrieval_limit = (
+            min(limit * candidate_multiplier, 500) if reranking_enabled else limit
+        )
+
         result = self.vector.search(
             query,
             user_id=user_id,
@@ -2219,7 +2740,7 @@ class MemoryService:
             agent_id=agent_id,
             filters=filters if filters else None,
             categories=expanded_categories,
-            limit=limit,
+            limit=retrieval_limit,
             exclude_expired=True,
             include_decayed=include_decayed,
             similarity_weight=self._config.memory.search_similarity_weight,
@@ -2239,6 +2760,8 @@ class MemoryService:
         # already handles importance reranking server-side.
         if used_hybrid:
             memories = self._importance_boost(memories)
+        memories = self._apply_layer_penalties(memories)
+        memories = self._apply_validation_decay(memories)
 
         # Score threshold: use hybrid threshold for RRF scores, dense
         # threshold otherwise. Note: with Qdrant's default k=1, RRF scores
@@ -2250,6 +2773,7 @@ class MemoryService:
         )
         pre_threshold_count = len(memories)
         memories = [m for m in memories if m.get("score", 0) >= threshold]
+        memories = memories[:limit]
 
         logger.info(
             "search_memories: mode=%s threshold=%.4f results=%d (filtered %d below threshold)",
@@ -2326,10 +2850,32 @@ class MemoryService:
         if query_vector is None:
             query_vector = self.vector.embedding.embed(query)
 
+        penalties_enabled = any(
+            isinstance(value, (int, float)) and value > 0
+            for value in (
+                self._config.memory.recall_raw_penalty,
+                self._config.memory.recall_superseded_penalty,
+            )
+        )
+        reranking_enabled = (
+            penalties_enabled
+            or getattr(self._config.memory, "validation_enabled", False) is True
+            or getattr(self._config.memory, "slow_decay_enabled", False) is True
+        )
+        configured_multiplier = getattr(
+            self._config.memory, "slow_decay_candidate_multiplier", 3
+        )
+        candidate_multiplier = max(
+            configured_multiplier if isinstance(configured_multiplier, int) else 3,
+            1,
+        )
+        retrieval_limit = (
+            min(limit * candidate_multiplier, 500) if reranking_enabled else limit
+        )
         search_kwargs: dict[str, Any] = {
             "filters": filters if filters else None,
             "categories": expanded_categories,
-            "limit": limit,
+            "limit": retrieval_limit,
             "exclude_expired": True,
             "include_decayed": include_decayed,
             "similarity_weight": self._config.memory.search_similarity_weight,
@@ -2418,6 +2964,8 @@ class MemoryService:
         # already handles importance reranking server-side.
         if used_hybrid:
             memories = self._importance_boost(memories)
+        memories = self._apply_layer_penalties(memories)
+        memories = self._apply_validation_decay(memories)
 
         # Score threshold: use hybrid threshold for RRF scores (with
         # Qdrant's default k=1, these are in a similar range to cosine)
@@ -2531,6 +3079,7 @@ class MemoryService:
         session_timezone: str | None = None,
         context: str | None = None,
         labels: dict[str, Any] | None = None,
+        track_access: bool = True,
     ) -> dict:
         """Find memories relevant to a complex question using AI-powered search.
 
@@ -2740,7 +3289,8 @@ class MemoryService:
         # Step 4: If few enough results, skip reranking
         if len(merged) <= limit:
             merged.sort(key=lambda m: m.get("score", 0), reverse=True)
-            self._track_access(merged)
+            if track_access:
+                self._track_access(merged)
             t_total = time.monotonic() - t_start
             logger.info(
                 "find_memories: total=%dms query_gen=%dms embed=%dms "
@@ -2794,20 +3344,21 @@ class MemoryService:
                 if isinstance(idx, int) and isinstance(rel, (int, float)):
                     score_map[idx] = float(rel)
 
-        # Apply LLM scores, filter by threshold, sort
+        # Apply LLM scores, then apply final ranking before thresholding.
         reranked = []
         for idx, mem in enumerate(rerank_candidates):
             if idx in score_map:
                 mem["score"] = round(score_map[idx], 4)
-                if mem["score"] >= threshold:
-                    reranked.append(mem)
+                reranked.append(mem)
 
-        reranked.sort(key=lambda m: m.get("score", 0), reverse=True)
+        reranked = self._apply_validation_decay(reranked)
+        reranked = [m for m in reranked if m.get("score", 0) >= threshold]
         reranked = reranked[:limit]
 
         dropped = len(rerank_candidates) - len(reranked)
 
-        self._track_access(reranked)
+        if track_access:
+            self._track_access(reranked)
 
         t_rerank = time.monotonic() - t_step
         t_total = time.monotonic() - t_start
@@ -2901,6 +3452,7 @@ class MemoryService:
             session_timezone=session_timezone,
             context=context,
             labels=labels,
+            track_access=False,
         )
 
         results = find_result.get("results", [])
@@ -2929,6 +3481,7 @@ class MemoryService:
         )
 
         answer = self._find_llm.generate(messages, operation="answer")
+        self._track_access(results)
 
         return {
             "answer": answer,
@@ -3021,6 +3574,7 @@ class MemoryService:
         owner_id: str | None = None,
         agent_id: str | None = None,
         recent_days: int | None = None,
+        track_access: bool = True,
     ) -> CoreMemoriesResult:
         """Assemble core context for conversation start.
 
@@ -3054,16 +3608,21 @@ class MemoryService:
         cache_key = (user_id, owner_id, agent_id or "", recent_days)
         cached = self._core_cache.get(cache_key)
         if cached is not None:
+            if track_access:
+                self.track_delivered_memory_ids(cached.memory_ids)
             return cached
 
         if agent_id and owner_id != user_id:
-            return self._get_shared_agent_core_memories(
+            result = self._get_shared_agent_core_memories(
                 user_id=user_id,
                 owner_id=owner_id,
                 agent_id=agent_id,
                 recent_days=recent_days,
                 cache_key=cache_key,
             )
+            if track_access:
+                self.track_delivered_memory_ids(result.memory_ids)
+            return result
 
         max_len = self._config.memory.max_core_context_length
         top_n = self._config.memory.core_top_memories
@@ -3434,6 +3993,8 @@ class MemoryService:
 
         result = CoreMemoriesResult(text=output, memory_ids=included_ids, stats=stats)
         self._core_cache.set(cache_key, result)
+        if track_access:
+            self.track_delivered_memory_ids(result.memory_ids)
         return result
 
     def _get_shared_agent_core_memories(
@@ -3488,7 +4049,11 @@ class MemoryService:
                 owner_id=owner_id,
                 subject_user_id=owner_id,
                 agent_id=agent_id,
-                filters={"pinned": False, "importance": imp_levels, "role": "assistant"},
+                filters={
+                    "pinned": False,
+                    "importance": imp_levels,
+                    "role": "assistant",
+                },
                 exclude_layers=_CORE_EXCLUDE_LAYERS,
                 limit=top_n * 3,
             )
@@ -3982,9 +4547,11 @@ class MemoryService:
         self,
         memory_id: str,
         *,
+        user_id: str | None = None,
+        owner_id: str | None = None,
         session_agent_id: str | None,
     ) -> None:
-        """Verify the session agent can access a memory.
+        """Verify the authenticated tenant and agent can access a memory.
 
         When session_agent_id is set, the memory must either:
         - Have no agent_id (shared memory) — accessible by all agents
@@ -3995,14 +4562,23 @@ class MemoryService:
         Memories belonging to a different agent are blocked.
 
         Raises ValueError if access is denied.
-        Does nothing if session_agent_id is None (no protection).
+        Legacy records without owner_id fail closed for authenticated mutations.
         """
-        if session_agent_id is None:
-            return  # No session agent — no protection
-
+        if user_id is None and owner_id is None and session_agent_id is None:
+            return
         mem = self.vector.get_by_id(memory_id)
         if mem is None:
             return  # Memory not found — let downstream handle 404
+
+        if owner_id is not None:
+            mem_owner_id = mem.get("owner_id")
+            if not mem_owner_id or mem_owner_id != owner_id:
+                raise ValueError(f"Cannot access memory '{memory_id}'")
+        if user_id is not None and mem.get("user_id") != user_id:
+            raise ValueError(f"Cannot access memory '{memory_id}'")
+
+        if session_agent_id is None:
+            return
 
         mem_agent_id = mem.get("agent_id")
         if mem_agent_id and mem_agent_id != session_agent_id:
@@ -4030,68 +4606,67 @@ class MemoryService:
         event_date: str | None = ...,  # type: ignore[assignment]
         agent_id: str | None = ...,  # type: ignore[assignment]
         labels: dict[str, Any] | None = None,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
+        operation_kind: str = "update",
+        actor_kind: str = "api",
+        operation_reason: str | None = None,
+        derived_from: list[str] | None = None,
+        audit: dict[str, Any] | None = None,
+        role: str | None = None,
     ) -> dict:
-        """Update a memory's content and/or metadata.
-
-        Content updates re-embed and replace the vector store point.
-        Metadata updates use direct payload updates to avoid losing
-        custom fields.
-
-        ttl_days: Set a new TTL (recalculates expires_at from now). Pass 0
-                  or None to make permanent. Uses sentinel default (...) to
-                  distinguish "not provided" from "explicitly set to None".
-        event_date: Set a new event date (ISO 8601). Pass None to clear.
-                    Uses sentinel default (...) to distinguish "not provided"
-                    from "explicitly set to None".
-        agent_id: Set or clear the agent_id. Pass None to clear. Uses
-                  sentinel default (...) to distinguish "not provided"
-                  from "explicitly set to None". Caller is responsible
-                  for authorization checks.
-        """
-        metadata_updates: dict[str, Any] = {}
+        """Create an immutable successor with updated content or metadata."""
+        clear_all_caches = user_id is None
+        if user_id is None:
+            existing = self.vector.get_by_id(memory_id)
+            if existing is None:
+                raise ValueError(f"Memory {memory_id} not found")
+            user_id = existing.get("user_id")
+        if not user_id:
+            raise ValueError("user_id is required")
+        owner_id = owner_id or user_id
+        changes: dict[str, Any] = {}
 
         if memory_type is not None:
-            metadata_updates["memory_type"] = validate_memory_type(memory_type)
+            changes["memory_type"] = validate_memory_type(memory_type)
         if categories is not None:
-            metadata_updates["categories"] = validate_categories(categories)
+            changes["categories"] = validate_categories(categories)
         if importance is not None:
-            metadata_updates["importance"] = validate_importance(importance)
+            changes["importance"] = validate_importance(importance)
         if pinned is not None:
-            metadata_updates["pinned"] = pinned
+            changes["pinned"] = pinned
         if labels is not None:
             if labels:
-                metadata_updates["labels"] = _validate_labels(
-                    labels, self._config.memory
-                )
+                changes["labels"] = _validate_labels(labels, self._config.memory)
             else:
-                metadata_updates["labels"] = {}
+                changes["labels"] = {}
+        if role is not None:
+            if role not in ("user", "assistant"):
+                raise ValueError("role must be 'user' or 'assistant'")
+            changes["role"] = role
 
-        # agent_id update: set or clear
         if agent_id is not ...:
             if agent_id is not None:
                 agent_id = _validate_id(agent_id, "agent_id")
-            metadata_updates["agent_id"] = agent_id
+            changes["agent_id"] = agent_id
 
-        # event_date update: parse and normalize, or clear if None
         if event_date is not ...:
             if event_date is not None:
                 default_tz = self._config.memory.default_timezone
-                metadata_updates["event_date"] = _parse_event_date(
-                    event_date, default_tz
-                )
+                changes["event_date"] = _parse_event_date(event_date, default_tz)
             else:
-                metadata_updates["event_date"] = None
+                changes["event_date"] = None
 
-        # TTL update: recalculate expires_at, clear decayed_at (restore)
         if ttl_days is not ...:
             from mnemory.ttl import calculate_expiration
 
             effective_ttl = ttl_days if ttl_days else None  # 0 → None (permanent)
-            metadata_updates["ttl_days"] = effective_ttl
-            metadata_updates["expires_at"] = calculate_expiration(effective_ttl)
-            metadata_updates["decayed_at"] = None  # Restore from decay
+            changes["ttl_days"] = effective_ttl
+            changes["expires_at"] = calculate_expiration(effective_ttl)
+            changes["decayed_at"] = None
 
-        # Update content (re-embeds)
         if content is not None:
             max_len = self._config.memory.max_memory_length
             if len(content) > max_len:
@@ -4101,31 +4676,42 @@ class MemoryService:
                         f"Content too long: {len(content)} chars (max {max_len})."
                     ),
                 }
-            self.vector.update_content(
+            changes["data"] = content
+
+        if not changes:
+            raise ValueError("No memory fields were provided")
+
+        with self._get_user_lock(f"memory:{memory_id}"):
+            result = self.revisions.revise(
                 memory_id,
-                content,
-                sparse_vector=self._get_sparse_vector(content),
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=session_agent_id,
+                changes=changes,
+                expected_revision=expected_revision,
+                idempotency_key=idempotency_key,
+                operation_kind=operation_kind,
+                actor_kind=actor_kind,
+                reason=operation_reason,
+                derived_from=derived_from,
+                audit=audit,
             )
 
-        # Update metadata directly on the vector store
-        if metadata_updates:
-            metadata_updates["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-            self.vector.update_metadata(memory_id, metadata_updates)
-
         # Invalidate caches — updated memory may be pinned or recent.
-        if user_id:
-            self._core_cache.invalidate_prefix(user_id)
-        else:
+        if clear_all_caches:
             self._core_cache.clear()
+        else:
+            self._core_cache.invalidate_prefix(user_id)
 
         # Invalidate category cache when categories are updated
         if categories is not None:
-            if user_id:
-                self._category_cache.invalidate(user_id)
-            else:
+            if clear_all_caches:
                 self._category_cache.clear()
+            else:
+                self._category_cache.invalidate(user_id)
 
-        return {"status": "updated", "memory_id": memory_id}
+        result["memory_id"] = result["revision_id"]
+        return result
 
     # ── Batch Retrieve ──────────────────────────────────────────────────
 
@@ -4134,6 +4720,8 @@ class MemoryService:
         memory_ids: list[str],
         *,
         user_id: str,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
     ) -> list[dict]:
         """Get multiple memories by IDs, filtered to the given user.
 
@@ -4144,29 +4732,149 @@ class MemoryService:
         """
         if not memory_ids:
             return []
-        memories = self.vector.get_by_ids(memory_ids)
-        # Filter to user-owned memories only (user_id is a top-level field
-        # in the dict returned by _point_to_memory).
-        return [m for m in memories if m.get("user_id") == user_id]
+        owner_id = owner_id or user_id
+        memories = []
+        seen_revision_ids = set()
+        for memory_id in memory_ids:
+            try:
+                revision_id, _ = self.revisions.current(
+                    memory_id,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    session_agent_id=session_agent_id,
+                )
+            except (ValueError, RevisionConflictError):
+                continue
+            if revision_id in seen_revision_ids:
+                continue
+            memory = self.vector.get_by_id(revision_id)
+            if memory is not None:
+                seen_revision_ids.add(revision_id)
+                memories.append(memory)
+        return memories
 
     # ── Delete Memory ─────────────────────────────────────────────────
 
-    def delete_memory(self, memory_id: str, *, user_id: str) -> dict:
-        """Delete a memory and clean up orphaned artifacts."""
+    def delete_memory(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+        expected_revision: int | None = None,
+        idempotency_key: str | None = None,
+        actor_kind: str = "api",
+        reason: str = "deleted",
+        audit: dict[str, Any] | None = None,
+    ) -> dict:
+        """Retract a memory while preserving its content and artifacts."""
         user_id = _validate_id(user_id, "user_id")
-
-        # Clean up artifacts with reference checking
-        try:
-            self._cleanup_memory_artifacts(user_id, memory_id)
-        except Exception as e:
-            logger.warning("Failed to delete artifacts for %s: %s", memory_id, e)
-
-        self.vector.delete(memory_id)
-
-        # Invalidate core cache for this user
+        owner_id = owner_id or user_id
+        with self._get_user_lock(f"memory:{memory_id}"):
+            result = self.revisions.retract(
+                memory_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=session_agent_id,
+                expected_revision=expected_revision,
+                idempotency_key=idempotency_key,
+                actor_kind=actor_kind,
+                reason=reason,
+                audit=audit,
+            )
         self._core_cache.invalidate_prefix(user_id)
+        self._category_cache.invalidate(user_id)
+        result["memory_id"] = memory_id
+        return result
 
-        return {"status": "deleted", "memory_id": memory_id}
+    def privacy_erase_memory(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Physically erase one lineage and its unreferenced artifacts."""
+        with self._get_user_lock(f"memory:{memory_id}"):
+            plan = self.revisions.prepare_privacy_erase(
+                memory_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=session_agent_id,
+            )
+            for artifact_id in plan.get("artifact_ids", []):
+                if self.vector.artifact_has_references_outside(
+                    artifact_id=artifact_id,
+                    excluded_memory_ids=plan["target_revision_ids"],
+                ):
+                    continue
+                try:
+                    self.artifact.delete_by_id(
+                        user_id=user_id,
+                        artifact_id=artifact_id,
+                    )
+                except FileNotFoundError:
+                    pass
+            result = self.revisions.finalize_privacy_erase(plan)
+        self._core_cache.invalidate_prefix(user_id)
+        self._category_cache.invalidate(user_id)
+        return result
+
+    def get_memory_history(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return all revisions and audit records for one lineage."""
+        return self.revisions.history(
+            memory_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
+
+    def get_memory_history_page(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None = None,
+        revision_before: int | None = None,
+        operation_before: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return one bounded history page for the management UI."""
+        return self.revisions.history_page(
+            memory_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+            revision_before=revision_before,
+            operation_before=operation_before,
+            limit=limit,
+        )
+
+    def get_memory_links(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Return supersession and derivation links for one revision."""
+        return self.revisions.links(
+            memory_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
 
     def delete_all_memories(self, *, user_id: str, agent_id: str | None = None) -> dict:
         """Delete all memories for a user (and optionally agent scope)."""
@@ -4266,6 +4974,9 @@ class MemoryService:
         content: str,
         filename: str = "note.md",
         content_type: str = "text/markdown",
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict:
         """Save an artifact attached to a memory.
 
@@ -4273,6 +4984,14 @@ class MemoryService:
         memory's metadata with the artifact reference.
         """
         user_id = _validate_id(user_id, "user_id")
+        owner_id = owner_id or user_id
+        current_id, _ = self.revisions.current(
+            memory_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+            expected_revision=expected_revision,
+        )
 
         meta = self.artifact.save(
             user_id=user_id,
@@ -4281,22 +5000,59 @@ class MemoryService:
             content_type=content_type,
         )
 
-        # Update the memory's artifacts list in vector store metadata
         try:
-            mem = self.vector.get_by_id(memory_id)
-            current_artifacts = (
-                (mem.get("metadata") or {}).get("artifacts", []) if mem else []
+            artifact_result = self.revisions.set_artifacts(
+                current_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=session_agent_id,
+                artifact=meta.to_dict(),
+                operation_kind="artifact_save",
+                idempotency_key=meta.artifact_id,
+                expected_revision=expected_revision,
             )
-
-            current_artifacts.append(meta.to_dict())
-            self.vector.update_metadata(memory_id, {"artifacts": current_artifacts})
-        except Exception as e:
-            logger.error("Failed to update artifact metadata on memory: %s", e)
+        except Exception:
+            recovered = False
+            try:
+                _, payload = self.revisions.current(
+                    current_id,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    session_agent_id=session_agent_id,
+                )
+                linked = any(
+                    item.get("id") == meta.artifact_id
+                    for item in payload.get("artifacts", [])
+                )
+                recovered = linked
+                if linked:
+                    artifact_result = {
+                        "lineage_id": payload["lineage_id"],
+                        "revision": int(payload.get("revision", 1)),
+                        "artifact_revision": int(payload.get("artifact_revision", 0)),
+                        "replayed": True,
+                    }
+                if not linked:
+                    self.artifact.delete_by_id(
+                        user_id=user_id,
+                        artifact_id=meta.artifact_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to clean up unlinked artifact %s",
+                    meta.artifact_id,
+                )
+            if not recovered:
+                raise
 
         return {
             "status": "saved",
             "artifact": meta.to_dict(),
-            "memory_id": memory_id,
+            "memory_id": current_id,
+            "lineage_id": artifact_result["lineage_id"],
+            "revision": artifact_result["revision"],
+            "artifact_revision": artifact_result["artifact_revision"],
+            "replayed": artifact_result.get("replayed", False),
         }
 
     def get_artifact(
@@ -4305,6 +5061,8 @@ class MemoryService:
         artifact_id: str,
         *,
         user_id: str,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
         offset: int = 0,
         limit: int = 5000,
     ) -> dict:
@@ -4315,7 +5073,12 @@ class MemoryService:
         """
         user_id = _validate_id(user_id, "user_id")
         # Get artifact metadata from the memory
-        artifacts_meta = self._get_artifacts_meta(user_id, memory_id)
+        artifacts_meta = self._get_artifacts_meta(
+            user_id,
+            memory_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
         return self.artifact.load(
             user_id=user_id,
             artifact_id=artifact_id,
@@ -4330,22 +5093,41 @@ class MemoryService:
         artifact_id: str,
         *,
         user_id: str,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
     ) -> tuple[bytes, str, str]:
         """Retrieve raw artifact bytes without encoding.
 
         Returns (raw_bytes, content_type, filename) for direct HTTP streaming.
         """
         user_id = _validate_id(user_id, "user_id")
-        artifacts_meta = self._get_artifacts_meta(user_id, memory_id)
+        artifacts_meta = self._get_artifacts_meta(
+            user_id,
+            memory_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
         return self.artifact.load_raw(
             user_id=user_id,
             artifact_id=artifact_id,
             artifacts_meta=artifacts_meta,
         )
 
-    def list_artifacts(self, memory_id: str, *, user_id: str) -> list[dict]:
+    def list_artifacts(
+        self,
+        memory_id: str,
+        *,
+        user_id: str,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+    ) -> list[dict]:
         """List all artifacts attached to a memory."""
-        return self._get_artifacts_meta(user_id, memory_id)
+        return self._get_artifacts_meta(
+            user_id,
+            memory_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
 
     def delete_artifact(
         self,
@@ -4353,6 +5135,9 @@ class MemoryService:
         artifact_id: str,
         *,
         user_id: str,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+        expected_revision: int | None = None,
     ) -> dict:
         """Delete an artifact and update the memory's metadata.
 
@@ -4361,29 +5146,54 @@ class MemoryService:
         removes the reference from this memory's metadata.
         """
         user_id = _validate_id(user_id, "user_id")
-        artifacts_meta = self._get_artifacts_meta(user_id, memory_id)
-
-        # Update memory metadata to remove the artifact reference
-        updated = [a for a in artifacts_meta if a.get("id") != artifact_id]
-        self.vector.update_metadata(memory_id, {"artifacts": updated})
+        owner_id = owner_id or user_id
+        current_id, _ = self.revisions.current(
+            memory_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+            expected_revision=expected_revision,
+        )
+        artifact_result = self.revisions.set_artifacts(
+            current_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+            remove_artifact_id=artifact_id,
+            operation_kind="artifact_delete",
+            idempotency_key=artifact_id,
+            expected_revision=expected_revision,
+        )
+        lineage_revision_ids = self.revisions.remove_artifact_from_lineage(
+            current_id,
+            artifact_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
 
         # Check if other memories still reference this artifact
-        if not self._artifact_has_other_references(
-            artifact_id, exclude_memory_id=memory_id
+        if not self.vector.artifact_has_references_outside(
+            artifact_id=artifact_id,
+            excluded_memory_ids=lineage_revision_ids,
         ):
-            # No other references — safe to delete the actual content
             try:
-                self.artifact.delete(
+                self.artifact.delete_by_id(
                     user_id=user_id,
                     artifact_id=artifact_id,
-                    artifacts_meta=artifacts_meta,
                 )
-            except Exception as e:
-                logger.warning(
-                    "Failed to delete artifact content %s: %s", artifact_id, e
-                )
+            except FileNotFoundError:
+                pass
 
-        return {"status": "deleted", "artifact_id": artifact_id, "memory_id": memory_id}
+        return {
+            "status": "deleted",
+            "artifact_id": artifact_id,
+            "memory_id": current_id,
+            "lineage_id": artifact_result["lineage_id"],
+            "revision": artifact_result["revision"],
+            "artifact_revision": artifact_result["artifact_revision"],
+            "replayed": artifact_result.get("replayed", False),
+        }
 
     # ── Private Helpers ───────────────────────────────────────────────
 
@@ -4480,12 +5290,22 @@ class MemoryService:
         all_cats = self._get_available_categories(user_id)
         return [c for c in all_cats if c.startswith("project:")]
 
-    def _get_artifacts_meta(self, user_id: str, memory_id: str) -> list[dict]:
+    def _get_artifacts_meta(
+        self,
+        user_id: str,
+        memory_id: str,
+        *,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+    ) -> list[dict]:
         """Get artifact metadata list from a memory's vector store entry."""
-        mem = self.vector.get_by_id(memory_id)
-        if mem:
-            return (mem.get("metadata") or {}).get("artifacts", [])
-        return []
+        payload = self.revisions.artifact_source(
+            memory_id,
+            user_id=user_id,
+            owner_id=owner_id or user_id,
+            session_agent_id=session_agent_id,
+        )
+        return list(payload.get("artifacts") or [])
 
     def _expand_category_filter(self, categories: list[str], user_id: str) -> list[str]:
         """Expand category prefix patterns into concrete category values.
@@ -4555,3 +5375,21 @@ class MemoryService:
                 self.vector.batch_update_metadata(updates)
             except Exception:
                 logger.warning("Failed to track memory access")
+
+    def track_delivered_memory_ids(self, memory_ids: set[str] | list[str]) -> None:
+        """Reinforce distinct memory revisions after successful delivery."""
+        try:
+            distinct = list(dict.fromkeys(memory_ids))
+            if distinct:
+                self._track_access(self.vector.get_by_ids(distinct))
+        except Exception:
+            logger.warning("Failed to load delivered memories for access tracking")
+
+    def _apply_validation_decay(self, memories: list[dict]) -> list[dict]:
+        """Apply bounded validation boost and optional gradual decay."""
+        for memory in memories:
+            memory["score"] = apply_validation_and_decay_score(
+                memory, self._config.memory
+            )
+        memories.sort(key=lambda item: item.get("score", 0), reverse=True)
+        return memories

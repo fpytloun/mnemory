@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnemory"
-version = "1.12.2"
+version = "1.13.0"
 description = "A self-hosted, two-tier memory system for AI agents and assistants"
 readme = "README.md"
 license = "Apache-2.0"

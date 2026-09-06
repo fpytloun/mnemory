@@ -67,6 +67,8 @@ def generate_download_token(
     memory_id: str,
     artifact_id: str,
     ttl_seconds: int = 3600,
+    owner_id: str | None = None,
+    agent_id: str | None = None,
 ) -> str:
     """Generate a short-lived HMAC-signed download token.
 
@@ -85,6 +87,8 @@ def generate_download_token(
             "u": user_id,
             "m": memory_id,
             "a": artifact_id,
+            "o": owner_id or user_id,
+            "g": agent_id,
             "e": int(time.time()) + ttl_seconds,
         },
         separators=(",", ":"),
@@ -118,6 +122,22 @@ def validate_download_token(
     Returns:
         The ``user_id`` from the token payload, or ``None`` if invalid.
     """
+    claims = validate_download_token_claims(
+        signing_key,
+        token,
+        memory_id,
+        artifact_id,
+    )
+    return claims["u"] if claims else None
+
+
+def validate_download_token_claims(
+    signing_key: bytes,
+    token: str,
+    memory_id: str,
+    artifact_id: str,
+) -> dict[str, str | None] | None:
+    """Validate a token and return its signed identity scope."""
     try:
         parts = token.split(".")
         if len(parts) != 2:
@@ -145,7 +165,11 @@ def validate_download_token(
         if payload["m"] != memory_id or payload["a"] != artifact_id:
             return None
 
-        return payload["u"]
+        return {
+            "u": payload["u"],
+            "o": payload.get("o") or payload["u"],
+            "g": payload.get("g"),
+        }
 
     except Exception:
         logger.debug("Download token validation failed", exc_info=True)

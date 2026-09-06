@@ -45,6 +45,7 @@ from mnemory.config import load_config
 from mnemory.instructions import VALID_MODES, build_instructions
 from mnemory.memory import MemoryService
 from mnemory.metrics import get_collector
+from mnemory.revisions import RevisionConflictError
 from mnemory.sanitize import escape_memory_headers
 
 logging.basicConfig(
@@ -72,6 +73,12 @@ _session_timezone: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 )
 _session_user_bound: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "session_user_bound", default=False
+)
+_session_auth_kind: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "session_auth_kind", default=None
+)
+_session_trusted_evidence: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "session_trusted_evidence", default=False
 )
 
 # ── Configuration ─────────────────────────────────────────────────────
@@ -424,8 +431,8 @@ async def initialize_memory(
     core_memories_error = None
     try:
         uid = _resolve_user_id(user_id)
-        aid = _resolve_agent_id_for_core(agent_id)
         owner_id = _get_session_owner_id()
+        aid = _resolve_agent_id_for_core(agent_id)
         collector = get_collector()
         if collector:
             collector.record_operation("initialize_memory", uid, aid)
@@ -1197,6 +1204,8 @@ async def update_memory(
     ttl_days: int | None = None,
     event_date: str | None = None,
     labels: dict[str, Any] | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Update an existing memory's content or metadata.
 
@@ -1210,11 +1219,14 @@ async def update_memory(
         ttl_days: New TTL in days. Restores decayed memories. Null = permanent.
         event_date: New event date (ISO 8601). Null to clear.
         labels: New labels (merged with existing). Empty dict to clear.
+        expected_revision: Expected active revision for stale-write detection.
+        idempotency_key: Retry key scoped to this lineage update.
     """
     try:
         # Verify ownership: must be own agent's memory or shared
         session_aid = _get_session_agent_id()
         session_uid = _session_user_id.get()
+        owner_id = _get_session_owner_id()
         collector = get_collector()
         if collector:
             collector.record_operation("update_memory", session_uid or "", session_aid)
@@ -1224,11 +1236,15 @@ async def update_memory(
         # "not provided" from "explicitly set to None"
         kwargs: dict = {
             "user_id": session_uid,
+            "owner_id": owner_id,
+            "session_agent_id": session_aid,
             "content": content,
             "memory_type": memory_type,
             "categories": categories,
             "importance": importance,
             "pinned": pinned,
+            "expected_revision": expected_revision,
+            "idempotency_key": idempotency_key,
         }
         if ttl_days is not None:
             kwargs["ttl_days"] = ttl_days
@@ -1237,14 +1253,10 @@ async def update_memory(
         if labels is not None:
             kwargs["labels"] = labels
 
-        # Verify + update in a single thread call to avoid TOCTOU race
-        # (ownership could change between two separate awaits).
-        def _verify_and_update():
-            service.verify_memory_access(memory_id, session_agent_id=session_aid)
-            return service.update_memory(memory_id, **kwargs)
-
-        result = await asyncio.to_thread(_verify_and_update)
+        result = await asyncio.to_thread(service.update_memory, memory_id, **kwargs)
         return json.dumps(result, default=str)
+    except RevisionConflictError as e:
+        return json.dumps(e.to_dict())
     except ValueError as e:
         return json.dumps({"error": True, "message": str(e)})
     except Exception:
@@ -1258,29 +1270,52 @@ async def update_memory(
 
 
 @mcp.tool()
-async def delete_memory(memory_id: str, user_id: str | None = None) -> str:
-    """Delete a specific memory and all its artifacts.
+async def delete_memory(
+    memory_id: str,
+    user_id: str | None = None,
+    expected_revision: int | None = None,
+    idempotency_key: str | None = None,
+    privacy_erase: bool = False,
+) -> str:
+    """Retract a memory, or explicitly erase its lineage for privacy.
 
     Args:
         memory_id: ID of the memory to delete.
+        expected_revision: Expected active revision for stale-write detection.
+        idempotency_key: Retry key scoped to this lineage retraction.
+        privacy_erase: Physically erase all revisions and artifacts.
     """
     try:
         uid = _resolve_user_id(user_id)
         # Verify ownership: must be own agent's memory or shared
         session_aid = _get_session_agent_id()
+        owner_id = _get_session_owner_id()
         collector = get_collector()
         if collector:
             collector.record_operation("delete_memory", uid, session_aid)
         service = _get_service()
 
-        # Verify + delete in a single thread call to avoid TOCTOU race
-        # (ownership could change between two separate awaits).
-        def _verify_and_delete():
-            service.verify_memory_access(memory_id, session_agent_id=session_aid)
-            return service.delete_memory(memory_id, user_id=uid)
-
-        result = await asyncio.to_thread(_verify_and_delete)
+        if privacy_erase:
+            result = await asyncio.to_thread(
+                service.privacy_erase_memory,
+                memory_id,
+                user_id=uid,
+                owner_id=owner_id,
+                session_agent_id=session_aid,
+            )
+        else:
+            result = await asyncio.to_thread(
+                service.delete_memory,
+                memory_id,
+                user_id=uid,
+                owner_id=owner_id,
+                session_agent_id=session_aid,
+                expected_revision=expected_revision,
+                idempotency_key=idempotency_key,
+            )
         return json.dumps(result)
+    except RevisionConflictError as e:
+        return json.dumps(e.to_dict())
     except ValueError as e:
         return json.dumps({"error": True, "message": str(e)})
     except Exception:
@@ -1297,6 +1332,7 @@ async def delete_memory(memory_id: str, user_id: str | None = None) -> str:
 async def delete_memories(
     memory_ids: list[str],
     user_id: str | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Delete multiple memories in a single call (batch operation).
 
@@ -1309,6 +1345,7 @@ async def delete_memories(
         return json.dumps({"error": True, "message": str(e)})
 
     session_aid = _get_session_agent_id()
+    owner_id = _get_session_owner_id()
     collector = get_collector()
     if collector:
         collector.record_operation("delete_memories", uid, session_aid)
@@ -1334,9 +1371,18 @@ async def delete_memories(
 
         for i, mid in enumerate(memory_ids):
             try:
-                service.verify_memory_access(mid, session_agent_id=session_aid)
-                result = service.delete_memory(mid, user_id=uid)
+                result = service.delete_memory(
+                    mid,
+                    user_id=uid,
+                    owner_id=owner_id,
+                    session_agent_id=session_aid,
+                    idempotency_key=(
+                        f"{idempotency_key}:{i}" if idempotency_key else None
+                    ),
+                )
                 results.append({"index": i, **result})
+            except RevisionConflictError as e:
+                errors.append({"index": i, **e.to_dict()})
             except ValueError as e:
                 errors.append({"index": i, "error": True, "message": str(e)})
             except Exception:
@@ -1456,6 +1502,8 @@ async def save_artifact(
     """
     try:
         uid = _resolve_user_id(user_id)
+        owner_id = _get_session_owner_id()
+        session_aid = _get_session_agent_id()
         collector = get_collector()
         if collector:
             collector.record_operation("save_artifact", uid)
@@ -1467,6 +1515,8 @@ async def save_artifact(
             content=content,
             filename=filename,
             content_type=content_type,
+            owner_id=owner_id,
+            session_agent_id=session_aid,
         )
         return json.dumps(result, default=str)
     except ValueError as e:
@@ -1502,6 +1552,8 @@ async def get_artifact(
     """
     try:
         uid = _resolve_user_id(user_id)
+        owner_id = _get_session_owner_id()
+        session_aid = _get_session_agent_id()
         collector = get_collector()
         if collector:
             collector.record_operation("get_artifact", uid)
@@ -1511,6 +1563,8 @@ async def get_artifact(
             memory_id,
             artifact_id,
             user_id=uid,
+            owner_id=owner_id,
+            session_agent_id=session_aid,
             offset=offset,
             limit=limit,
         )
@@ -1560,12 +1614,18 @@ async def list_artifacts(memory_id: str, user_id: str | None = None) -> str:
     """
     try:
         uid = _resolve_user_id(user_id)
+        owner_id = _get_session_owner_id()
+        session_aid = _get_session_agent_id()
         collector = get_collector()
         if collector:
             collector.record_operation("list_artifacts", uid)
         service = _get_service()
         artifacts = await asyncio.to_thread(
-            service.list_artifacts, memory_id, user_id=uid
+            service.list_artifacts,
+            memory_id,
+            user_id=uid,
+            owner_id=owner_id,
+            session_agent_id=session_aid,
         )
         if not artifacts:
             return json.dumps({"artifacts": [], "message": "No artifacts found."})
@@ -1594,12 +1654,21 @@ async def delete_artifact(
     """
     try:
         uid = _resolve_user_id(user_id)
+        owner_id = _get_session_owner_id()
+        session_aid = _get_session_agent_id()
+        owner_id = _get_session_owner_id()
+        session_aid = _get_session_agent_id()
         collector = get_collector()
         if collector:
             collector.record_operation("delete_artifact", uid)
         service = _get_service()
         result = await asyncio.to_thread(
-            service.delete_artifact, memory_id, artifact_id, user_id=uid
+            service.delete_artifact,
+            memory_id,
+            artifact_id,
+            user_id=uid,
+            owner_id=owner_id,
+            session_agent_id=session_aid,
         )
         return json.dumps(result)
     except ValueError as e:
@@ -1635,6 +1704,8 @@ async def get_artifact_url(
         from mnemory.tokens import generate_download_token
 
         uid = _resolve_user_id(user_id)
+        owner_id = _get_session_owner_id()
+        session_aid = _get_session_agent_id()
         collector = get_collector()
         if collector:
             collector.record_operation("get_artifact_url", uid)
@@ -1649,7 +1720,11 @@ async def get_artifact_url(
         # Verify the artifact exists and user has access before generating a token.
         service = _get_service()
         artifacts = await asyncio.to_thread(
-            service.list_artifacts, memory_id, user_id=uid
+            service.list_artifacts,
+            memory_id,
+            user_id=uid,
+            owner_id=owner_id,
+            session_agent_id=session_aid,
         )
         if not any(a["id"] == artifact_id for a in artifacts):
             return json.dumps(
@@ -1662,6 +1737,8 @@ async def get_artifact_url(
             memory_id=memory_id,
             artifact_id=artifact_id,
             ttl_seconds=ttl_seconds,
+            owner_id=owner_id,
+            agent_id=session_aid,
         )
 
         # Build the URL path.
@@ -1801,9 +1878,11 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             if request.url.path.endswith("/raw"):
                 dl_token = request.query_params.get("token", "")
                 if dl_token:
-                    dl_uid = self._validate_download_token(request, dl_token)
-                    if dl_uid:
-                        _session_user_id.set(dl_uid)
+                    dl_claims = self._validate_download_token(request, dl_token)
+                    if dl_claims:
+                        _session_user_id.set(dl_claims["u"])
+                        _session_owner_id.set(dl_claims["o"])
+                        _session_agent_id.set(dl_claims["g"])
                         _session_user_bound.set(True)
                     # If token is invalid, fall through to no-auth path
                     # (no auth configured, so access is allowed anyway)
@@ -1819,15 +1898,18 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             if request.url.path.endswith("/raw"):
                 dl_token = request.query_params.get("token", "")
                 if dl_token:
-                    dl_uid = self._validate_download_token(request, dl_token)
-                    if dl_uid:
-                        _session_user_id.set(dl_uid)
+                    dl_claims = self._validate_download_token(request, dl_token)
+                    if dl_claims:
+                        _session_user_id.set(dl_claims["u"])
+                        _session_owner_id.set(dl_claims["o"])
+                        _session_agent_id.set(dl_claims["g"])
                         _session_user_bound.set(True)
                         try:
                             return await call_next(request)
                         finally:
                             _session_user_id.set(None)
                             _session_agent_id.set(None)
+                            _session_owner_id.set(None)
                             _session_timezone.set(None)
                             _session_user_bound.set(False)
                     else:
@@ -1888,6 +1970,12 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                     logger.info("JWT auth rejected; falling back to API key auth")
                 else:
                     logger.info("Auth resolved via JWT for user=%s", auth_ctx.user_id)
+                    _session_auth_kind.set("jwt")
+                    _session_trusted_evidence.set(
+                        auth_ctx.agent_id is None
+                        and auth_ctx.token_type == "user_event"
+                        and "mnemory:evidence" in auth_ctx.scopes
+                    )
                     _session_user_id.set(auth_ctx.user_id)
                     _session_owner_id.set(auth_ctx.owner_id or auth_ctx.user_id)
                     _session_user_bound.set(True)
@@ -1903,6 +1991,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                         _session_owner_id.set(None)
                         _session_timezone.set(None)
                         _session_user_bound.set(False)
+                        _session_auth_kind.set(None)
+                        _session_trusted_evidence.set(False)
 
             # Try MCP_API_KEYS first (key -> user_id mapping)
             mapped_user_id = None
@@ -2021,7 +2111,9 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
     _RAW_PATH_RE = re.compile(r"/memories/([^/]+)/artifacts/([^/]+)/raw$")
 
     @staticmethod
-    def _validate_download_token(request: Request, token: str) -> str | None:
+    def _validate_download_token(
+        request: Request, token: str
+    ) -> dict[str, str | None] | None:
         """Validate a download token from a /raw URL query parameter.
 
         Extracts memory_id and artifact_id from the URL path and
@@ -2030,7 +2122,7 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         Returns:
             The user_id from the token if valid, None otherwise.
         """
-        from mnemory.tokens import validate_download_token
+        from mnemory.tokens import validate_download_token_claims
 
         # Extract memory_id and artifact_id from URL path.
         # Expected: /api/memories/{mid}/artifacts/{aid}/raw
@@ -2040,12 +2132,62 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             return None
         memory_id, artifact_id = match.group(1), match.group(2)
 
-        return validate_download_token(
+        return validate_download_token_claims(
             signing_key=_get_signing_key(),
             token=token,
             memory_id=memory_id,
             artifact_id=artifact_id,
         )
+
+
+class EvidenceAuthMiddleware(BaseHTTPMiddleware):
+    """Confine Cognis user-event JWTs to the synchronous evidence route."""
+
+    _PATH = "/api/evidence/remember/v1"
+
+    async def dispatch(self, request: Request, call_next):
+        is_target = request.method == "POST" and request.url.path == self._PATH
+        authorization = request.headers.get("authorization", "")
+        token = (
+            authorization[7:].strip()
+            if authorization.lower().startswith("bearer ")
+            else ""
+        )
+        cookie_token = request.cookies.get("cognis_session", "").strip()
+        if not is_target and not token:
+            token = cookie_token
+        validator = None
+        if token:
+            cfg = _get_config().server
+            validator = get_jwt_validator(cfg.jwt_public_key, cfg.jwks_url)
+
+        if is_target:
+            if any(name.lower().startswith("x-agent-") for name in request.headers):
+                return JSONResponse(
+                    {"error": "Evidence requests cannot set agent headers"},
+                    status_code=401,
+                )
+            if not token or validator is None:
+                return JSONResponse({"error": "Evidence JWT required"}, status_code=401)
+            try:
+                claims = validator.validate_evidence(token)
+            except (InvalidTokenError, ValueError, TypeError):
+                return JSONResponse({"error": "Invalid evidence JWT"}, status_code=401)
+            request.state.evidence_claims = claims
+            request.state.evidence_token = True
+            return await call_next(request)
+
+        if token and validator is not None:
+            try:
+                evidence_intent = validator.is_evidence_intent(token)
+            except (InvalidTokenError, ValueError, TypeError):
+                evidence_intent = False
+            if evidence_intent:
+                return JSONResponse(
+                    {"error": "Evidence JWT is only valid for the evidence route"},
+                    status_code=403,
+                )
+        return await call_next(request)
 
 
 async def health_check(request: Request) -> JSONResponse:
@@ -2258,7 +2400,10 @@ def create_app() -> Starlette:
 
     from mnemory.api import create_api_app
 
-    middleware = [Middleware(APIKeyMiddleware)]
+    middleware = [
+        Middleware(EvidenceAuthMiddleware),
+        Middleware(APIKeyMiddleware),
+    ]
 
     routes: list[Route | Mount] = []
 

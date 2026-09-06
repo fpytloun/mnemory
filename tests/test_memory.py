@@ -92,6 +92,25 @@ def _make_service(auto_classify=False, track_access=False):
 
     # Replace with fresh mocks for test control
     service.vector = MagicMock()
+    service.revisions = MagicMock()
+    service.revisions.revise.return_value = {
+        "operation_id": "op-1",
+        "lineage_id": "mem-123",
+        "previous_revision_id": "mem-123",
+        "revision_id": "mem-456",
+        "revision": 2,
+        "status": "updated",
+        "replayed": False,
+    }
+    service.revisions.retract.return_value = {
+        "operation_id": "op-1",
+        "lineage_id": "mem-123",
+        "previous_revision_id": "mem-123",
+        "revision_id": None,
+        "revision": 1,
+        "status": "retracted",
+        "replayed": False,
+    }
     service._llm = MagicMock()
     service._find_llm = service._llm
 
@@ -1153,12 +1172,9 @@ class TestRoleParameter:
             role="assistant",
         )
 
-        # update_metadata must have been called with role='assistant'
-        service.vector.update_metadata.assert_called_once()
-        written_meta = service.vector.update_metadata.call_args[0][1]
-        assert written_meta.get("role") == "assistant", (
-            f"Expected role='assistant' in update_metadata call, got: {written_meta}"
-        )
+        service.revisions.revise.assert_called_once()
+        changes = service.revisions.revise.call_args.kwargs["changes"]
+        assert changes["role"] == "assistant"
 
     def test_role_user_written_on_update_action(self):
         """UPDATE with role='user' must also write role into metadata_update.
@@ -1221,9 +1237,9 @@ class TestRoleParameter:
             user_id="filip",
         )
 
-        service.vector.update_metadata.assert_called_once()
-        written_meta = service.vector.update_metadata.call_args[0][1]
-        assert written_meta.get("role") == "user"
+        service.revisions.revise.assert_called_once()
+        changes = service.revisions.revise.call_args.kwargs["changes"]
+        assert changes["role"] == "user"
 
 
 # ── infer=False security restrictions ─────────────────────────────────
@@ -1291,6 +1307,26 @@ class TestInferFalseRestrictions:
         )
 
         assert "results" in result
+
+    def test_add_direct_checks_mutation_guard_at_insert_sink(self):
+        service = _make_service()
+        guard = MagicMock(side_effect=RuntimeError("lease lost"))
+
+        with pytest.raises(RuntimeError, match="lease lost"):
+            service.add_memory(
+                content="A consolidated fact",
+                user_id="filip",
+                infer=False,
+                memory_type="fact",
+                categories=[],
+                importance="normal",
+                pinned=False,
+                _trusted=True,
+                _mutation_guard=guard,
+            )
+
+        guard.assert_called_once()
+        service.vector.insert.assert_not_called()
 
 
 # ── Core memories with role-based sections ────────────────────────────
@@ -2415,8 +2451,8 @@ class TestUpdateMemoryTTL:
         service = _make_service()
         result = service.update_memory("mem-1", ttl_days=60, user_id="filip")
         assert result["status"] == "updated"
-        service.vector.update_metadata.assert_called_once()
-        meta = service.vector.update_metadata.call_args[0][1]
+        service.revisions.revise.assert_called_once()
+        meta = service.revisions.revise.call_args.kwargs["changes"]
         assert meta["ttl_days"] == 60
         assert meta["expires_at"] is not None
         assert meta["decayed_at"] is None  # Restored from decay
@@ -2425,7 +2461,7 @@ class TestUpdateMemoryTTL:
         """Updating TTL should clear decayed_at (restore from decay)."""
         service = _make_service()
         service.update_memory("mem-1", ttl_days=30, user_id="filip")
-        meta = service.vector.update_metadata.call_args[0][1]
+        meta = service.revisions.revise.call_args.kwargs["changes"]
         assert meta["decayed_at"] is None
 
     def test_update_categories_invalidates_cache(self):
@@ -2435,7 +2471,7 @@ class TestUpdateMemoryTTL:
         # Category cache should be invalidated for this user
         # (We can't easily test cache internals, but we can verify
         # the method completes without error)
-        assert service.vector.update_metadata.called
+        assert service.revisions.revise.called
 
 
 class TestExpandCategoryFilter:
@@ -2626,9 +2662,8 @@ class TestExtractionPipeline:
 
         assert len(result["results"]) == 1
         assert result["results"][0]["event"] == "UPDATE"
-        assert result["results"][0]["id"] == "existing-uuid"
-        service.vector.update_content.assert_called_once()
-        service.vector.update_metadata.assert_called_once()
+        assert result["results"][0]["id"] == "mem-456"
+        service.revisions.revise.assert_called_once()
 
     def test_add_with_empty_extraction(self):
         """LLM returning empty memories list should return empty results."""
@@ -3667,8 +3702,8 @@ class TestVectorOwnerScopeFallback:
 
         query_filter = store._client.query_points.call_args.kwargs["prefetch"].filter
         self._assert_owner_fallback(query_filter.must[0], "owner@example.com")
-        assert getattr(query_filter.must[1], "key", None) == "user_id"
-        assert getattr(getattr(query_filter.must[1], "match", None), "value", None) == (
+        assert getattr(query_filter.must[2], "key", None) == "user_id"
+        assert getattr(getattr(query_filter.must[2], "match", None), "value", None) == (
             "owner@example.com"
         )
 
@@ -3685,8 +3720,8 @@ class TestVectorOwnerScopeFallback:
 
         query_filter = store._client.query_points.call_args.kwargs["query_filter"]
         self._assert_owner_fallback(query_filter.must[0], "owner@example.com")
-        assert getattr(query_filter.must[1], "key", None) == "user_id"
-        assert getattr(getattr(query_filter.must[1], "match", None), "value", None) == (
+        assert getattr(query_filter.must[2], "key", None) == "user_id"
+        assert getattr(getattr(query_filter.must[2], "match", None), "value", None) == (
             "owner@example.com"
         )
 
@@ -3705,9 +3740,9 @@ class TestVectorOwnerScopeFallback:
 
         scroll_filter = store._client.scroll.call_args.kwargs["scroll_filter"]
         self._assert_owner_fallback(scroll_filter.must[0], "owner@example.com")
-        assert getattr(scroll_filter.must[2], "key", None) == "user_id"
+        assert getattr(scroll_filter.must[3], "key", None) == "user_id"
         assert getattr(
-            getattr(scroll_filter.must[2], "match", None), "value", None
+            getattr(scroll_filter.must[3], "match", None), "value", None
         ) == ("owner@example.com")
 
     def test_owner_fallback_does_not_run_without_owner_scope(self):
@@ -4023,6 +4058,33 @@ class TestImportanceBoost:
         # Should be sorted by score descending
         assert result[0]["id"] == "critical"
         assert result[-1]["id"] == "low"
+
+
+class TestLayerPenalties:
+    def test_raw_and_superseded_penalties_apply_independently(self):
+        service = _make_service()
+        memories = [
+            {
+                "id": "consolidated",
+                "score": 0.8,
+                "metadata": {"memory_layer": "consolidated"},
+            },
+            {"id": "raw", "score": 0.8, "metadata": {"memory_layer": "raw"}},
+            {
+                "id": "superseded",
+                "score": 0.8,
+                "metadata": {"memory_layer": "raw", "superseded_by": "new"},
+            },
+            {"id": "legacy", "score": 0.8, "metadata": {}},
+        ]
+
+        result = service._apply_layer_penalties(memories)
+        scores = {memory["id"]: memory["score"] for memory in result}
+
+        assert scores["consolidated"] == 0.8
+        assert scores["legacy"] == 0.8
+        assert scores["raw"] == 0.75
+        assert scores["superseded"] == 0.65
 
 
 # ── find_memories ─────────────────────────────────────────────────────
@@ -4468,7 +4530,9 @@ class TestFindMemories:
 
         service = _make_service()
         service.vector.search.return_value = {
-            "results": [{"id": "user", "score": 0.8, "memory": "User episodic", "metadata": {}}]
+            "results": [
+                {"id": "user", "score": 0.8, "memory": "User episodic", "metadata": {}}
+            ]
         }
 
         results = service.search_memories_dual_scope(
@@ -5432,7 +5496,7 @@ class TestRememberTwoStagePipeline:
         )
 
         assert result.get("error") is None
-        assert result["results"] == []  # SKIP means nothing stored
+        assert result["results"][0]["event"] == "SKIP"
         assert service._llm.generate.call_count == 2
 
     def test_two_stage_no_candidates_skips_dedup_llm(self):
@@ -5498,8 +5562,122 @@ class TestRememberTwoStagePipeline:
         assert len(result["results"]) == 1
         assert result["results"][0]["event"] == "UPDATE"
 
-    def test_unmentioned_facts_default_to_add(self):
-        """Facts not mentioned in dedup response should default to ADD."""
+    def test_dedup_confirm_action_uses_independent_user_evidence(self):
+        service = _make_service()
+        service._config.memory.validation_enabled = True
+        service._config.memory.validation_ttl_multiplier = 2.0
+        service._config.memory.validation_max_score_roots = 3
+        service.revisions.confirm.return_value = {
+            "operation_id": "operation-1",
+            "lineage_id": "lineage-1",
+            "revision_id": "existing-home",
+            "revision": 1,
+            "status": "confirmed",
+            "replayed": False,
+        }
+        extraction_resp = self._make_extraction_response(
+            [{"text": "User lives in Prague"}]
+        )
+        dedup_resp = self._make_dedup_response(
+            [
+                {
+                    "fact_index": 0,
+                    "action": "CONFIRM",
+                    "text": "User lives in Prague",
+                    "target_id": 0,
+                }
+            ]
+        )
+        service._llm.generate.side_effect = [extraction_resp, dedup_resp]
+        service.vector.embedding.embed_batch.return_value = [[0.1] * 1536]
+        service.vector.search_similar.return_value = [
+            {
+                "id": "existing-home",
+                "memory": "User lives in Prague",
+                "score": 0.95,
+                "metadata": {},
+            }
+        ]
+
+        result = service.remember(
+            content="I still live in Prague",
+            user_id="filip",
+            session_id="session-2",
+            _trusted_evidence=True,
+        )
+
+        assert result["results"][0]["event"] == "CONFIRM"
+        kwargs = service.revisions.confirm.call_args.kwargs
+        assert kwargs["source_kind"] == "raw_user_message"
+        assert kwargs["evidence_root_id"] == kwargs["source_fingerprint"]
+
+    def test_untrusted_evidence_cannot_confirm(self):
+        service = _make_service()
+        service._config.memory.validation_enabled = True
+        result = service._execute_action(
+            {
+                "action": "CONFIRM",
+                "text": "User lives in Prague",
+                "target_id": "existing-home",
+                "_candidate_validated": True,
+                "memory_type": "fact",
+                "categories": [],
+                "importance": "normal",
+                "pinned": False,
+            },
+            user_id="filip",
+            owner_id="filip",
+            agent_id=None,
+            role="user",
+            ttl_days=None,
+            explicit_fields={},
+            vector_map=None,
+            validation_eligible=False,
+        )
+        assert result["event"] == "SKIP"
+        service.revisions.confirm.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "source_kind",
+        ["assistant_paraphrase", "untrusted_user_message", "fsck"],
+    )
+    def test_ineligible_add_keeps_source_provenance_but_no_validation_root(
+        self, source_kind
+    ):
+        service = _make_service()
+        service.vector.insert.return_value = "memory-1"
+        action = {
+            "action": "ADD",
+            "text": "User lives in Prague",
+            "memory_type": "fact",
+            "categories": [],
+            "importance": "normal",
+            "pinned": False,
+        }
+
+        service._execute_action(
+            action,
+            user_id="filip",
+            owner_id="filip",
+            agent_id=None,
+            role="user",
+            ttl_days=None,
+            explicit_fields={},
+            vector_map={"User lives in Prague": [0.1] * 1536},
+            source_kind=source_kind,
+            source_fingerprint="provenance-source",
+            evidence_root_id="must-not-validate",
+            validation_eligible=False,
+        )
+
+        metadata = service.vector.insert.call_args.kwargs["metadata"]
+        assert metadata["source_fingerprint"] == "provenance-source"
+        assert metadata["validation_eligible"] is False
+        assert metadata["evidence_root_ids"] == []
+        assert metadata["validation_count"] == 0
+
+    def test_unmentioned_facts_fail_closed(self):
+        """Partial dedup output must not mutate memory after one retry."""
 
         service = _make_service()
 
@@ -5529,15 +5707,13 @@ class TestRememberTwoStagePipeline:
         ]
         service.vector.insert.side_effect = ["mem-1", "mem-2"]
 
-        result = service.remember(
-            content="I like Python, Rust, and Go",
-            user_id="filip",
-        )
-
-        assert result.get("error") is None
-        # Fact 0 was SKIPped, facts 1 and 2 should be ADDed
-        assert len(result["results"]) == 2
-        assert all(r["event"] == "ADD" for r in result["results"])
+        with pytest.raises(RuntimeError, match="no memories changed"):
+            service.remember(
+                content="I like Python, Rust, and Go",
+                user_id="filip",
+            )
+        service.vector.insert.assert_not_called()
+        assert service._llm.generate.call_count == 3
 
     def test_oversized_fact_truncated(self):
         """Oversized facts from extraction should be truncated."""
@@ -6239,9 +6415,8 @@ class TestRememberAutoMode:
         insert_call = service.vector.insert.call_args
         assert insert_call.kwargs.get("role") == "user"
 
-    def test_dedup_llm_failure_preserves_per_fact_role(self):
-        """When the dedup LLM call fails, the fallback ADD-all path should
-        preserve per-fact roles from extraction."""
+    def test_dedup_llm_failure_fails_closed(self):
+        """Dedup provider failure must not mutate memory after one retry."""
         service = _make_service()
 
         extraction_resp = self._make_auto_extraction_response(
@@ -6271,24 +6446,17 @@ class TestRememberAutoMode:
         ]
         service.vector.insert.side_effect = ["mem-1", "mem-2"]
 
-        result = service.remember(
-            content="User: I like Python\nAssistant: I recommend FastAPI",
-            user_id="filip",
-            agent_id="test-agent",
-        )
+        with pytest.raises(RuntimeError, match="no memories changed"):
+            service.remember(
+                content="User: I like Python\nAssistant: I recommend FastAPI",
+                user_id="filip",
+                agent_id="test-agent",
+            )
+        service.vector.insert.assert_not_called()
+        assert service._llm.generate.call_count == 3
 
-        assert result.get("error") is None
-        assert len(result["results"]) == 2
-
-        # Verify roles are preserved in the fallback path
-        insert_calls = service.vector.insert.call_args_list
-        roles = [c.kwargs.get("role") for c in insert_calls]
-        assert "user" in roles
-        assert "assistant" in roles
-
-    def test_dedup_unmentioned_fact_preserves_role(self):
-        """When the dedup LLM omits a fact from its response, the fallback
-        ADD action should preserve the per-fact role."""
+    def test_dedup_unmentioned_fact_fails_closed(self):
+        """Partial dedup output must not mutate either role."""
         import json
 
         service = _make_service()
@@ -6325,20 +6493,14 @@ class TestRememberAutoMode:
         ]
         service.vector.insert.side_effect = ["mem-1", "mem-2"]
 
-        result = service.remember(
-            content="User: I like Python\nAssistant: I recommend FastAPI",
-            user_id="filip",
-            agent_id="test-agent",
-        )
-
-        assert result.get("error") is None
-        assert len(result["results"]) == 2
-
-        # Verify both roles are preserved
-        insert_calls = service.vector.insert.call_args_list
-        roles = [c.kwargs.get("role") for c in insert_calls]
-        assert "user" in roles
-        assert "assistant" in roles
+        with pytest.raises(RuntimeError, match="no memories changed"):
+            service.remember(
+                content="User: I like Python\nAssistant: I recommend FastAPI",
+                user_id="filip",
+                agent_id="test-agent",
+            )
+        service.vector.insert.assert_not_called()
+        assert service._llm.generate.call_count == 3
 
 
 class TestMNArtifactLinking:
@@ -6484,8 +6646,7 @@ class TestMNArtifactLinking:
         long_content = "x" * 2000
         result = service.add_memory(content=long_content, user_id="filip", infer=True)
 
-        # Only 1 memory added (SKIP doesn't produce a result)
-        assert len(result["results"]) == 1
+        assert [item["event"] for item in result["results"]] == ["ADD", "SKIP"]
         assert "artifact" in result
         # Only linked to the ADD memory, not the SKIP
         assert result["artifact"]["linked_memories"] == 1
@@ -6494,8 +6655,8 @@ class TestMNArtifactLinking:
 class TestArtifactCleanup:
     """Test artifact cleanup when memories are deleted."""
 
-    def test_delete_memory_deletes_orphan_artifact(self):
-        """Deleting a memory should delete its artifact if no other references exist."""
+    def test_delete_memory_preserves_orphan_artifact(self):
+        """Retraction must preserve an artifact for revision history."""
         service = _make_service()
         service.vector.get_by_id.return_value = {
             "id": "mem-1",
@@ -6518,10 +6679,9 @@ class TestArtifactCleanup:
 
         service.delete_memory("mem-1", user_id="filip")
 
-        service.vector.delete.assert_called_once_with("mem-1")
-        service.artifact.delete_by_id.assert_called_once_with(
-            user_id="filip", artifact_id="art-1"
-        )
+        service.revisions.retract.assert_called_once()
+        service.vector.delete.assert_not_called()
+        service.artifact.delete_by_id.assert_not_called()
 
     def test_delete_memory_preserves_shared_artifact(self):
         """Deleting a memory should NOT delete artifact if other memories reference it."""
@@ -6547,12 +6707,12 @@ class TestArtifactCleanup:
 
         service.delete_memory("mem-1", user_id="filip")
 
-        service.vector.delete.assert_called_once_with("mem-1")
-        # Artifact should NOT be deleted
+        service.revisions.retract.assert_called_once()
+        service.vector.delete.assert_not_called()
         service.artifact.delete_by_id.assert_not_called()
 
     def test_delete_memory_no_artifacts(self):
-        """Deleting a memory with no artifacts should just delete the memory."""
+        """Retraction without artifacts must still retain the revision."""
         service = _make_service()
         service.vector.get_by_id.return_value = {
             "id": "mem-1",
@@ -6565,7 +6725,8 @@ class TestArtifactCleanup:
 
         service.delete_memory("mem-1", user_id="filip")
 
-        service.vector.delete.assert_called_once_with("mem-1")
+        service.revisions.retract.assert_called_once()
+        service.vector.delete.assert_not_called()
         service.artifact.delete_by_id.assert_not_called()
         service.vector.artifact_has_references.assert_not_called()
 
@@ -6816,14 +6977,16 @@ class TestGetByIds:
         """get_memories_by_ids returns only memories owned by the given user."""
         service = _make_service()
 
-        # Simulate vector.get_by_ids returning memories for different users.
-        # user_id is a TOP-LEVEL field (promoted by _point_to_memory),
-        # NOT inside metadata.
-        service.vector.get_by_ids.return_value = [
-            {"id": "m1", "user_id": "filip", "memory": "A", "metadata": {}},
-            {"id": "m2", "user_id": "other-user", "memory": "B", "metadata": {}},
-            {"id": "m3", "user_id": "filip", "memory": "C", "metadata": {}},
-        ]
+        def current(memory_id, **kwargs):
+            if memory_id == "m2":
+                raise ValueError("Cannot access memory")
+            return memory_id, {"user_id": kwargs["user_id"]}
+
+        service.revisions.current.side_effect = current
+        service.vector.get_by_id.side_effect = {
+            "m1": {"id": "m1", "user_id": "filip", "memory": "A", "metadata": {}},
+            "m3": {"id": "m3", "user_id": "filip", "memory": "C", "metadata": {}},
+        }.get
 
         result = service.get_memories_by_ids(["m1", "m2", "m3"], user_id="filip")
 

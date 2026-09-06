@@ -1,8 +1,7 @@
 /**
  * mnemory UI — Memories Browse Tab (Alpine.js component).
  *
- * Lists all memories with filtering, client-side pagination and sorting,
- * inline expand, add/edit/delete, and artifact management.
+ * Lists memories with authorized cursor pagination and revision management.
  * Edit modal and artifact manager are global stores (app.js).
  */
 
@@ -11,30 +10,41 @@ function memoriesTab() {
     // ── State ──────────────────────────────────────────────────
     memories: [],
     loading: false,
+    loadError: '',
 
     filters: {
       memory_type: '',
       categories: [],
       role: '',
-      limit: 5000,
       include_decayed: false,
       labels_json: '',
     },
 
-    sortBy: 'newest',
+    sortBy: 'storage',
     filterArtifactsOnly: false,
     filterAgentId: '',
     filterDecayedOnly: false,
     filterMemoryLayer: '',
 
-    /** Current page (1-indexed). Each page shows pageSize items. */
-    page: 1,
     pageSize: 50,
-    /** Whether the server may have more results beyond our limit */
+    nextCursor: null,
+    loadGeneration: 0,
     hasMoreOnServer: false,
 
-    expandedId: null,
     availableCategories: [],
+    detailReturnFocus: null,
+    detail: {
+      open: false,
+      memory: null,
+      tab: 'current',
+      history: null,
+      links: null,
+      loading: false,
+      error: '',
+      retractConfirm: false,
+      eraseConfirm: false,
+      eraseText: '',
+    },
 
     // Add memory modal (local — only triggered from this tab)
     addModal: {
@@ -84,6 +94,13 @@ function memoriesTab() {
         }
         this._loadAgentIds();
       });
+      window.addEventListener('mnemory:stale-revision', (event) => {
+        this.loadMemories(false).then(() => {
+          const currentId = event.detail?.current_revision_id;
+          const current = this.memories.find((memory) => memory.id === currentId);
+          if (current) this.openDetail(current);
+        });
+      });
 
       this.loadCategories();
       this._loadAgentIds();
@@ -101,50 +118,51 @@ function memoriesTab() {
     // ── Data Loading ──────────────────────────────────────────
 
     async loadMemories(append = false) {
-      if (!append) this.memories = [];
+      const generation = append ? this.loadGeneration : ++this.loadGeneration;
+      this.loadError = '';
       this.loading = true;
       try {
         const params = {
-          limit: this.filters.limit,
+          limit: this.pageSize,
           include_decayed: this.filterDecayedOnly ? true : this.filters.include_decayed,
+          decayed_only: this.filterDecayedOnly,
+          has_artifacts: this.filterArtifactsOnly,
+          memory_layer: this.filterMemoryLayer,
+          agent_id: this.filterAgentId,
         };
+        if (append && this.nextCursor) params.cursor = this.nextCursor;
         if (this.filters.memory_type) params.memory_type = this.filters.memory_type;
         if (this.filters.categories.length > 0) params.categories = this.filters.categories.join(',');
         if (this.filters.role) params.role = this.filters.role;
-        // No sort param — all sorting is client-side now
+        if (this.filters.labels_json) params.labels = this.filters.labels_json;
 
-        const data = await MnemoryAPI.listMemories(params);
+        const data = await MnemoryAPI.browseMemories(params);
+        if (generation !== this.loadGeneration) return;
         const results = data.results || [];
         this.memories = append ? this.memories.concat(results) : results;
-        this.hasMoreOnServer = results.length >= this.filters.limit;
-        this.page = 1;
+        this.nextCursor = data.next_cursor || null;
+        this.hasMoreOnServer = !!data.has_more;
       } catch (err) {
-        Alpine.store('notify').error(`Failed to load memories: ${err.message}`);
+        if (generation === this.loadGeneration) {
+          this.loadError = err.message;
+          Alpine.store('notify').error(`Failed to load memories: ${err.message}`);
+        }
       } finally {
-        this.loading = false;
+        if (generation === this.loadGeneration) this.loading = false;
       }
     },
 
     loadMore() {
-      const filtered = this._filteredAndSorted();
-      if (this.page * this.pageSize < filtered.length) {
-        // More items available in the current dataset
-        this.page++;
-      } else if (this.hasMoreOnServer) {
-        // Fetch more from server
-        this.filters.limit += 5000;
-        this.loadMemories(false);
-      }
+      if (this.hasMoreOnServer && !this.loadError) this.loadMemories(true);
     },
 
     applyFilters() {
-      this.page = 1;
       this.loadMemories(false);
     },
 
-    /** Called when sort dropdown changes — all client-side now */
+    /** Cursor order is stable point-ID order. */
     onSortChange() {
-      this.page = 1;
+      this.loadMemories(false);
     },
 
     // ── Sorting & Filtering ──────────────────────────────────
@@ -159,99 +177,150 @@ function memoriesTab() {
       }
     },
 
-    _importanceWeight(importance) {
-      return { critical: 4, high: 3, normal: 2, low: 1 }[importance] ?? 2;
-    },
-
-    /** Apply all client-side filters and sorting, return full array */
-    _filteredAndSorted() {
-      let arr = [...this.memories];
-
-      // Client-side filter: only decayed
-      if (this.filterDecayedOnly) {
-        arr = arr.filter(m => m.metadata?.decayed_at);
-      }
-
-      // Client-side filter: has artifacts only
-      if (this.filterArtifactsOnly) {
-        arr = arr.filter(m => m.has_artifacts);
-      }
-
-      // Client-side filter: agent_id
-      if (this.filterAgentId) {
-        if (this.filterAgentId === '_none_') {
-          arr = arr.filter(m => !m.metadata?.agent_id);
-        } else {
-          arr = arr.filter(m => m.metadata?.agent_id === this.filterAgentId);
-        }
-      }
-
-      // Client-side filter: labels
-      if (this.filters.labels_json) {
-        try {
-          const filterLabels = JSON.parse(this.filters.labels_json);
-          arr = arr.filter(m => {
-            const memLabels = m.metadata?.labels || {};
-            return Object.entries(filterLabels).every(([k, v]) => memLabels[k] === v);
-          });
-        } catch (e) {
-          // Invalid JSON — skip labels filter
-        }
-      }
-
-      // Client-side filter: memory layer
-      if (this.filterMemoryLayer) {
-        arr = arr.filter(m => (m.metadata?.memory_layer || 'consolidated') === this.filterMemoryLayer);
-      }
-
-      // All sorting is client-side
-      switch (this.sortBy) {
-        case 'newest':
-          arr.sort((a, b) => {
-            const da = a.metadata?.created_at_utc || '';
-            const db = b.metadata?.created_at_utc || '';
-            return db.localeCompare(da);
-          });
-          break;
-        case 'oldest':
-          arr.sort((a, b) => {
-            const da = a.metadata?.created_at_utc || '';
-            const db = b.metadata?.created_at_utc || '';
-            return da.localeCompare(db);
-          });
-          break;
-        case 'importance':
-          arr.sort((a, b) => this._importanceWeight(b.metadata?.importance) - this._importanceWeight(a.metadata?.importance));
-          break;
-        case 'type':
-          arr.sort((a, b) => (a.metadata?.memory_type || '').localeCompare(b.metadata?.memory_type || ''));
-          break;
-        case 'alpha':
-          arr.sort((a, b) => (a.memory || '').localeCompare(b.memory || ''));
-          break;
-      }
-      return arr;
-    },
-
-    /** Total number of memories after filtering (before pagination) */
     get totalFiltered() {
-      return this._filteredAndSorted().length;
+      return this.memories.length;
     },
 
     /** Paginated slice of filtered+sorted memories */
     get sortedMemories() {
-      return this._filteredAndSorted().slice(0, this.page * this.pageSize);
+      return this.memories;
     },
 
     /** Whether the "Load More" button should be visible */
     get canLoadMore() {
-      return (this.page * this.pageSize < this.totalFiltered) || this.hasMoreOnServer;
+      return this.hasMoreOnServer && !this.loadError;
     },
 
-    // ── Expand / Collapse ─────────────────────────────────────
+    async openDetail(memory) {
+      this.detailReturnFocus = document.activeElement;
+      if (!memory.metadata) {
+        memory = {
+          ...memory,
+          _projectionOnly: true,
+          metadata: {
+            revision: memory.revision,
+            revision_state: memory.revision_state,
+            memory_type: memory.memory_type,
+            memory_layer: memory.memory_layer,
+          },
+        };
+      }
+      this.detail = {
+        open: true, memory, tab: 'current', history: null, links: null,
+        loading: false, error: '', retractConfirm: false,
+        eraseConfirm: false, eraseText: '',
+      };
+      await this.$nextTick();
+      this.$refs.memoryDetailClose?.focus();
+    },
 
-    toggleExpand(id) {
-      this.expandedId = this.expandedId === id ? null : id;
+    closeDetail() {
+      this.detail.open = false;
+      this.$nextTick(() => this.detailReturnFocus?.focus());
+    },
+
+    async selectDetailTab(tab) {
+      this.detail.tab = tab;
+      if (tab === 'current') return;
+      const field = tab === 'history' ? 'history' : 'links';
+      if (this.detail[field]) return;
+      this.detail.loading = true;
+      this.detail.error = '';
+      try {
+        this.detail[field] = tab === 'history'
+          ? await MnemoryAPI.getMemoryHistory(this.detail.memory.id)
+          : await MnemoryAPI.getMemoryLinks(this.detail.memory.id);
+      } catch (err) {
+        this.detail.error = err.message;
+      } finally {
+        this.detail.loading = false;
+      }
+    },
+
+    async loadMoreHistory(kind) {
+      const history = this.detail.history;
+      const cursorKey = kind === 'revision' ? 'next_revision_cursor' : 'next_operation_cursor';
+      const cursor = history?.[cursorKey];
+      if (!cursor || this.detail.loading) return;
+      this.detail.loading = true;
+      try {
+        const params = kind === 'revision'
+          ? { revision_cursor: cursor }
+          : { operation_cursor: cursor };
+        const page = await MnemoryAPI.getMemoryHistory(this.detail.memory.id, params);
+        if (kind === 'revision') history.revisions.unshift(...page.revisions);
+        else history.operations.push(...page.operations);
+        history[cursorKey] = page[cursorKey];
+      } catch (err) {
+        this.detail.error = err.message;
+      } finally {
+        this.detail.loading = false;
+      }
+    },
+
+    historyEntries() {
+      const history = this.detail.history;
+      if (!history) return [];
+      const revisions = history.revisions.map((value) => ({
+        kind: 'revision',
+        timestamp: value.metadata?.created_at_utc || '',
+        value,
+      }));
+      const operations = history.operations.map((value) => ({
+        kind: 'operation',
+        timestamp: value.created_at_utc || '',
+        value,
+      }));
+      return revisions.concat(operations).sort((a, b) => a.timestamp.localeCompare(b.timestamp));
+    },
+
+    revisionDiff(index) {
+      const revisions = this.detail.history?.revisions || [];
+      if (index < 1) return [];
+      const previous = revisions[index - 1];
+      const current = revisions[index];
+      const changes = [];
+      if (previous.memory !== current.memory) {
+        changes.push({ field: 'Text', before: previous.memory, after: current.memory });
+      }
+      const fields = ['memory_type', 'categories', 'importance', 'pinned', 'ttl_days', 'event_date', 'labels'];
+      for (const field of fields) {
+        const before = JSON.stringify(previous.metadata?.[field] ?? null);
+        const after = JSON.stringify(current.metadata?.[field] ?? null);
+        if (before !== after) changes.push({ field, before, after });
+      }
+      return changes;
+    },
+
+    diffForRevision(id) {
+      const revisions = this.detail.history?.revisions || [];
+      return this.revisionDiff(revisions.findIndex((item) => item.id === id));
+    },
+
+    handleDetailTabKey(event) {
+      const tabs = ['current', 'history', 'links'];
+      const current = tabs.indexOf(this.detail.tab);
+      const delta = event.key === 'ArrowRight' ? 1 : -1;
+      const next = tabs[(current + delta + tabs.length) % tabs.length];
+      this.selectDetailTab(next);
+      this.$nextTick(() => document.getElementById(`memory-tab-${next}`)?.focus());
+    },
+
+    trapDetailFocus(event) {
+      const dialog = event.currentTarget;
+      const focusable = [...dialog.querySelectorAll(
+        'button:not([disabled]), input:not([disabled]), [tabindex="0"]'
+      )].filter((element) => element.offsetParent !== null);
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     },
 
     // ── Add Memory ────────────────────────────────────────────
@@ -327,28 +396,19 @@ function memoriesTab() {
     // ── Edit Memory (delegates to global store) ───────────────
 
     openEdit(mem) {
-      Alpine.store('memoryEdit').show(mem, (payload) => {
-        // Update the local memory object immediately
-        const idx = this.memories.findIndex(m => m.id === mem.id);
-        if (idx !== -1) {
-          const m = this.memories[idx];
-          if (payload.content !== undefined) m.memory = payload.content;
-          if (!m.metadata) m.metadata = {};
-          if (payload.memory_type) m.metadata.memory_type = payload.memory_type;
-          if (payload.categories) m.metadata.categories = payload.categories;
-          if (payload.importance) m.metadata.importance = payload.importance;
-          if (payload.pinned !== undefined) m.metadata.pinned = payload.pinned;
-          if (payload.ttl_days !== undefined) m.metadata.ttl_days = payload.ttl_days;
-          if (payload.agent_id !== undefined) m.metadata.agent_id = payload.agent_id || null;
-          if ('labels' in payload) m.metadata.labels = payload.labels;
-        }
-      });
+      const returnFocus = this.detailReturnFocus;
+      this.detail.open = false;
+      Alpine.store('memoryEdit').show(mem, () => {
+        this.loadMemories(false);
+      }, returnFocus);
     },
 
     // ── Artifacts (delegates to global store) ─────────────────
 
     openArtifacts(mem) {
-      Alpine.store('artifactMgr').show(mem);
+      const returnFocus = this.detailReturnFocus;
+      this.detail.open = false;
+      Alpine.store('artifactMgr').show(mem, returnFocus);
     },
 
     // ── Bulk Selection ─────────────────────────────────────────
@@ -403,7 +463,10 @@ function memoriesTab() {
       for (let i = 0; i < toDelete.length; i += 10) {
         const batch = toDelete.slice(i, i + 10);
         const results = await Promise.allSettled(
-          batch.map(id => MnemoryAPI.deleteMemory(id))
+          batch.map(id => {
+            const memory = this.memories.find((item) => item.id === id);
+            return MnemoryAPI.deleteMemory(id, memory?.metadata?.revision);
+          })
         );
         for (let j = 0; j < results.length; j++) {
           if (results[j].status === 'fulfilled') {
@@ -414,11 +477,7 @@ function memoriesTab() {
         }
       }
 
-      // Remove successfully deleted from local state
-      const deletedSet = new Set(toDelete);
-      // Keep only memories that weren't in the delete list, or that failed
-      // For simplicity, remove all attempted — failures are rare
-      this.memories = this.memories.filter(m => !deletedSet.has(m.id));
+      await this.loadMemories(false);
 
       this.selectedIds = [];
       this.bulkDeleteConfirm = false;
@@ -426,23 +485,45 @@ function memoriesTab() {
       this.bulkMode = false;
 
       if (failed > 0) {
-        Alpine.store('notify').warning(`Deleted ${deleted} memories, ${failed} failed`);
+        Alpine.store('notify').warning(`Retracted ${deleted} memories, ${failed} failed`);
       } else {
-        Alpine.store('notify').success(`Deleted ${deleted} memories`);
+        Alpine.store('notify').success(`Retracted ${deleted} memories`);
       }
     },
 
     // ── Delete ────────────────────────────────────────────────
 
     async deleteMemory(id) {
+      const memory = this.memories.find((item) => item.id === id) || this.detail.memory;
       try {
-        await MnemoryAPI.deleteMemory(id);
+        await MnemoryAPI.deleteMemory(id, memory?.metadata?.revision);
         this.memories = this.memories.filter((m) => m.id !== id);
         this.deleteConfirm = null;
-        Alpine.store('notify').success('Memory deleted');
+        this.closeDetail();
+        Alpine.store('notify').success('Memory retracted. Its history remains available.');
       } catch (err) {
+        if (err.status === 409) {
+          window.dispatchEvent(new CustomEvent('mnemory:stale-revision', {
+            detail: err.detail || {},
+          }));
+          Alpine.store('notify').warning('A newer revision exists. The view was refreshed.');
+          return;
+        }
         this.deleteConfirm = null;
-        Alpine.store('notify').error(`Failed to delete: ${err.message}`);
+        Alpine.store('notify').error(`Failed to retract: ${err.message}`);
+      }
+    },
+
+    async privacyErase() {
+      if (this.detail.eraseText !== 'ERASE') return;
+      const id = this.detail.memory.id;
+      try {
+        await MnemoryAPI.privacyEraseMemory(id);
+        this.memories = this.memories.filter((memory) => memory.id !== id);
+        this.closeDetail();
+        Alpine.store('notify').success('The memory lineage was permanently erased.');
+      } catch (err) {
+        Alpine.store('notify').error(`Privacy erase failed: ${err.message}`);
       }
     },
 

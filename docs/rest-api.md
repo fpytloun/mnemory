@@ -16,8 +16,11 @@ Both MCP and REST share the same `MemoryService` backend and authentication midd
 | `/api/memories/recent` | GET | Recent memories |
 | `/api/memories` | GET | List memories |
 | `/api/memories/by-ids` | POST | Fetch memories by ID list (batch) |
-| `/api/memories/{id}` | PUT | Update memory |
-| `/api/memories/{id}` | DELETE | Delete memory |
+| `/api/memories/{id}` | PUT | Create a successor revision |
+| `/api/memories/{id}` | DELETE | Retract without erasing history |
+| `/api/memories/{id}/privacy` | DELETE | Explicitly erase a lineage and unreferenced artifacts |
+| `/api/memories/{id}/history` | GET | Get immutable revisions and audit records |
+| `/api/memories/{id}/links` | GET | Get exact supersession and derivation links |
 | `/api/memories/{id}/artifacts` | POST | Save artifact |
 | `/api/memories/{id}/artifacts` | GET | List artifacts |
 | `/api/memories/{id}/artifacts/{aid}` | GET | Get artifact (JSON with base64 for binary) |
@@ -25,6 +28,63 @@ Both MCP and REST share the same `MemoryService` backend and authentication midd
 | `/api/memories/{id}/artifacts/{aid}/raw` | GET | Download raw artifact bytes (token or API key auth) |
 | `/api/memories/{id}/artifacts/{aid}` | DELETE | Delete artifact |
 | `/api/categories` | GET | List categories |
+
+Artifact deletion removes the reference from the selected revision. Immutable
+history can retain the artifact bytes. Use lineage privacy erasure when the
+artifact content must be physically removed from all revisions.
+
+## Revision preconditions
+
+The four REST mutation classes accept an optional `If-Match` header:
+
+- `PUT /api/memories/{id}`
+- `DELETE /api/memories/{id}`
+- `POST /api/memories/{id}/artifacts`
+- `DELETE /api/memories/{id}/artifacts/{aid}`
+
+The value is the positive integer `revision` returned by memory and mutation
+responses. A bare value (`If-Match: 3`) or strong quoted value
+(`If-Match: "3"`) is valid. Weak entity tags, lists, wildcards, snapshot
+hashes, zero, negative values, and other strings return HTTP 400.
+
+Memory update bodies and memory delete queries retain `expected_revision`.
+When a request supplies both forms, their integer values must match. A
+conflict returns HTTP 409 before mutation. A valid but stale revision also
+returns HTTP 409. Artifact mutation responses retain `lineage_id`, `revision`,
+`artifact_revision`, and replay state. Signed artifact download URLs are not
+affected by this contract.
+
+## Fsck operation recovery
+
+`POST /api/fsck/audit` starts a bounded audit for the exact memory IDs and
+revisions of one existing fsck operation. The request accepts at most 20
+targets. The audit does not search a neighbor corpus, stamp `checked_at`, or
+change memory metadata. Its completed journal record contains fingerprints and
+counts, but no memory content.
+
+`POST /api/fsck/operations/{operation_id}/re-evaluate` compares an old fsck
+operation with a newer completed exact audit bound to that operation. A normal
+or historically rehydrated check is rejected. The default
+`terminalize=false` is mutation-free and does not apply actions. With explicit
+`terminalize=true`, the endpoint marks the old journal entry `superseded`.
+Applying the fresh issue remains a separate explicit request.
+
+## Failed-session diagnostics and retry
+
+`GET /api/sessions/failed/diagnostics` returns aggregate failure metadata.
+`GET /api/sessions/failed/retry-eligibility` returns authorized, content-free
+candidate metadata. Eligibility validates every linked raw-memory revision for
+existence, exact scope, raw layer, active state, and supersession. Diagnostics
+include stable ineligibility reason counts.
+
+`POST /api/sessions/failed/retry` defaults to
+`dry_run=true`, which creates no operation record and changes no session.
+
+Mutation requires `LEGACY_FAILED_RETRY_ENABLED=true`, an idempotency key, and
+an explicit list of no more than ten eligible sessions. Retries run
+sequentially and stop on configured failure, revision, or timeout conditions.
+The execution path repeats linked-input validation immediately before it
+creates or claims the retry journal.
 
 `GET /api/memories/core` supports:
 
@@ -97,6 +157,7 @@ Built-in memory consistency checker. Runs a three-phase pipeline to detect quali
 | Endpoint | Method | Description |
 |---|---|---|
 | `/api/fsck` | POST | Start a memory check (runs in background) |
+| `/api/fsck/audit` | POST | Start an exact-target, audit-only check |
 | `/api/fsck/auto-run` | POST | Trigger an immediate auto-fsck run for the current user |
 | `/api/fsck/{id}` | GET | Poll check status, progress, and results |
 | `/api/fsck/{id}/apply` | POST | Apply selected fixes from a completed check |

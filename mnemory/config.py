@@ -333,6 +333,72 @@ class MemoryConfig:
         default_factory=lambda: _env_bool("TRACK_MEMORY_ACCESS", True)
     )
 
+    # Independent-evidence validation. Ranking influence is bounded even when
+    # more evidence roots are retained for provenance and TTL refresh.
+    validation_enabled: bool = field(
+        default_factory=lambda: _env_bool("VALIDATION_ENABLED", True)
+    )
+    validation_max_score_roots: int = field(
+        default_factory=lambda: _env_int("VALIDATION_MAX_SCORE_ROOTS", 3)
+    )
+    validation_max_score_boost: float = field(
+        default_factory=lambda: _env_float("VALIDATION_MAX_SCORE_BOOST", 0.10)
+    )
+    validation_ttl_multiplier: float = field(
+        default_factory=lambda: _env_float("VALIDATION_TTL_MULTIPLIER", 2.0)
+    )
+
+    # Optional gradual ranking decay. Disabled by default to preserve the
+    # existing ranking behavior during rollout.
+    slow_decay_enabled: bool = field(
+        default_factory=lambda: _env_bool("SLOW_DECAY_ENABLED", False)
+    )
+    slow_decay_half_life_days: float = field(
+        default_factory=lambda: _env_float("SLOW_DECAY_HALF_LIFE_DAYS", 30.0)
+    )
+    slow_decay_score_floor: float = field(
+        default_factory=lambda: _env_float("SLOW_DECAY_SCORE_FLOOR", 0.25)
+    )
+    slow_decay_validation_half_life_multiplier: float = field(
+        default_factory=lambda: _env_float(
+            "SLOW_DECAY_VALIDATION_HALF_LIFE_MULTIPLIER", 2.0
+        )
+    )
+    slow_decay_candidate_multiplier: int = field(
+        default_factory=lambda: _env_int("SLOW_DECAY_CANDIDATE_MULTIPLIER", 3)
+    )
+
+    # Fsck operation recovery and bounded legacy-session retry controls.
+    fsck_recovery_lease_seconds: int = field(
+        default_factory=lambda: _env_int("FSCK_RECOVERY_LEASE_SECONDS", 300)
+    )
+    fsck_recovery_max_attempts: int = field(
+        default_factory=lambda: _env_int("FSCK_RECOVERY_MAX_ATTEMPTS", 3)
+    )
+    fsck_stranded_after_seconds: int = field(
+        default_factory=lambda: _env_int("FSCK_STRANDED_AFTER_SECONDS", 3600)
+    )
+    legacy_failed_retry_enabled: bool = field(
+        default_factory=lambda: _env_bool("LEGACY_FAILED_RETRY_ENABLED", False)
+    )
+    legacy_failed_retry_max_batch: int = field(
+        default_factory=lambda: _env_int("LEGACY_FAILED_RETRY_MAX_BATCH", 10)
+    )
+    legacy_failed_retry_max_raw_memories: int = field(
+        default_factory=lambda: _env_int("LEGACY_FAILED_RETRY_MAX_RAW_MEMORIES", 100)
+    )
+    legacy_failed_retry_stop_failure_ratio: float = field(
+        default_factory=lambda: _env_float(
+            "LEGACY_FAILED_RETRY_STOP_FAILURE_RATIO", 0.20
+        )
+    )
+    legacy_failed_retry_stop_min_attempts: int = field(
+        default_factory=lambda: _env_int("LEGACY_FAILED_RETRY_STOP_MIN_ATTEMPTS", 5)
+    )
+    legacy_failed_retry_timeout_seconds: int = field(
+        default_factory=lambda: _env_int("LEGACY_FAILED_RETRY_TIMEOUT_SECONDS", 300)
+    )
+
     # Search quality thresholds
     search_score_threshold: float = field(
         default_factory=lambda: _env_float("SEARCH_SCORE_THRESHOLD", 0.30)
@@ -640,6 +706,38 @@ class Config:
             )
         if self.memory.session_backend == "redis" and not self.memory.redis_url:
             raise ValueError("REDIS_URL is required when SESSION_BACKEND=redis")
+        if self.memory.validation_max_score_roots < 1:
+            raise ValueError("VALIDATION_MAX_SCORE_ROOTS must be at least 1")
+        if not 0.0 <= self.memory.validation_max_score_boost <= 1.0:
+            raise ValueError("VALIDATION_MAX_SCORE_BOOST must be between 0 and 1")
+        if self.memory.validation_ttl_multiplier < 1.0:
+            raise ValueError("VALIDATION_TTL_MULTIPLIER must be at least 1")
+        if self.memory.slow_decay_half_life_days <= 0:
+            raise ValueError("SLOW_DECAY_HALF_LIFE_DAYS must be greater than 0")
+        if not 0.0 <= self.memory.slow_decay_score_floor <= 1.0:
+            raise ValueError("SLOW_DECAY_SCORE_FLOOR must be between 0 and 1")
+        if self.memory.slow_decay_validation_half_life_multiplier < 1.0:
+            raise ValueError(
+                "SLOW_DECAY_VALIDATION_HALF_LIFE_MULTIPLIER must be at least 1"
+            )
+        if self.memory.slow_decay_candidate_multiplier < 1:
+            raise ValueError("SLOW_DECAY_CANDIDATE_MULTIPLIER must be at least 1")
+        if self.memory.fsck_recovery_lease_seconds < 1:
+            raise ValueError("FSCK_RECOVERY_LEASE_SECONDS must be at least 1")
+        if self.memory.fsck_recovery_max_attempts < 1:
+            raise ValueError("FSCK_RECOVERY_MAX_ATTEMPTS must be at least 1")
+        if not 1 <= self.memory.legacy_failed_retry_max_batch <= 10:
+            raise ValueError("LEGACY_FAILED_RETRY_MAX_BATCH must be between 1 and 10")
+        if self.memory.legacy_failed_retry_max_raw_memories < 1:
+            raise ValueError("LEGACY_FAILED_RETRY_MAX_RAW_MEMORIES must be at least 1")
+        if not 0 <= self.memory.legacy_failed_retry_stop_failure_ratio <= 1:
+            raise ValueError(
+                "LEGACY_FAILED_RETRY_STOP_FAILURE_RATIO must be between 0 and 1"
+            )
+        if self.memory.legacy_failed_retry_stop_min_attempts < 1:
+            raise ValueError("LEGACY_FAILED_RETRY_STOP_MIN_ATTEMPTS must be at least 1")
+        if self.memory.legacy_failed_retry_timeout_seconds < 1:
+            raise ValueError("LEGACY_FAILED_RETRY_TIMEOUT_SECONDS must be at least 1")
         if self.server.jwt_public_key and self.server.jwks_url:
             raise ValueError(
                 "Configure only one JWT verifier source: "

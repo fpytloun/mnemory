@@ -64,13 +64,13 @@ EXTRACTION_SCHEMA: dict[str, Any] = {
                         },
                         "action": {
                             "type": "string",
-                            "enum": ["ADD", "UPDATE", "DELETE", "NONE"],
+                            "enum": ["ADD", "UPDATE", "CONFIRM", "SKIP"],
                         },
                         "target_id": {
                             "type": ["string", "null"],
                             "description": (
-                                "ID of existing memory for UPDATE/DELETE, "
-                                "null for ADD/NONE"
+                                "ID of existing memory for UPDATE/CONFIRM, "
+                                "null for ADD/SKIP"
                             ),
                         },
                         "old_memory": {
@@ -499,10 +499,10 @@ the dynamic parameters section of the user message below.
 
 - **ADD**: New information not present in existing memories. Use target_id=null.
 - **UPDATE**: Modifies, enriches, or replaces an existing memory. Set target_id to the existing memory's ID and old_memory to its current text. The text field should contain the NEW, updated content.
-- **DELETE**: Contradicts an existing memory that should be removed. Set target_id to the existing memory's ID. The text field should contain the memory being deleted.
-- **NONE**: Already captured in existing memories. Skip it (do not include in output).
+- **CONFIRM**: The new raw user evidence independently supports an existing memory. Set target_id to the existing memory's ID.
+- **SKIP**: Already captured, but the source is not new independent user evidence. Do not include it in output.
 
-When an existing memory already captures the same information as the extracted fact (same meaning, same subject), use action NONE to avoid duplicates.
+When an existing memory captures the same information, use CONFIRM only for new raw user evidence. Otherwise use SKIP.
 
 ### Subject preservation
 
@@ -513,7 +513,7 @@ When an existing memory already captures the same information as the extracted f
 - "User moved to Berlin" CAN update "User lives in Prague"
   — same subject (user's location).
 - When in doubt between ADD and UPDATE, prefer ADD.
-- When in doubt between ADD and NONE, prefer ADD if the new fact
+- When in doubt between ADD and SKIP, prefer ADD if the new fact
   adds any specific detail not present in the existing memory.
 
 When updating, keep the same meaning but incorporate new
@@ -524,7 +524,7 @@ updated memory.
 
 Existing: [{{"id": "0", "text": "User's email is john@example.com"}}]
 Extracted fact: "User's email is john@example.com"
-→ action: NONE (already captured exactly)
+→ action: CONFIRM (new raw user evidence supports the existing memory)
 
 Existing: [{{"id": "0", "text": "User lives in Prague"}}]
 Extracted fact: "User moved to Berlin"
@@ -760,10 +760,10 @@ the dynamic parameters section of the user message below.
 
 - **ADD**: New information not present in existing memories. Use target_id=null.
 - **UPDATE**: Modifies, enriches, or replaces an existing memory. Set target_id to the existing memory's ID and old_memory to its current text. The text field should contain the NEW, updated content.
-- **DELETE**: Contradicts an existing memory that should be removed. Set target_id to the existing memory's ID. The text field should contain the memory being deleted.
-- **NONE**: Already captured in existing memories. Skip it (do not include in output).
+- **CONFIRM**: The new raw user evidence independently supports an existing memory. Set target_id to the existing memory's ID.
+- **SKIP**: Already captured, but the source is not new independent user evidence. Do not include it in output.
 
-When an existing memory already captures the same information as the extracted fact (same meaning, same subject), use action NONE to avoid duplicates.
+Assistant evidence cannot create independent validation. Use SKIP for unchanged assistant facts.
 
 ### Subject preservation
 
@@ -774,7 +774,7 @@ When an existing memory already captures the same information as the extracted f
 - "Assistant now prefers brief responses" CAN update
   "Assistant prefers verbose responses" — same subject.
 - When in doubt between ADD and UPDATE, prefer ADD.
-- When in doubt between ADD and NONE, prefer ADD if the new fact
+- When in doubt between ADD and SKIP, prefer ADD if the new fact
   adds any specific detail not present in the existing memory.
 
 When updating, keep the same meaning but incorporate new
@@ -785,7 +785,7 @@ updated memory.
 
 Existing: [{{"id": "0", "text": "Assistant's name is Bob"}}]
 Extracted fact: "Assistant is called Bob"
-→ action: NONE (already captured exactly)
+→ action: SKIP (assistant evidence cannot independently confirm itself)
 
 Existing: [{{"id": "0", "text": "Assistant prefers verbose responses"}}]
 Extracted fact: "Assistant now prefers brief responses"
@@ -844,7 +844,7 @@ def build_extraction_prompt(
     event_date: str | None = None,
     session_timezone: str | None = None,
     context: str | None = None,
-) -> tuple[list[dict[str, str]], dict[str, Any], dict[str, str]]:
+) -> tuple[list[dict[str, str]], dict[str, Any], dict[str, Any]]:
     """Build the unified extraction+classification+dedup prompt.
 
     Args:
@@ -1010,6 +1010,8 @@ def build_extraction_prompt(
 def parse_extraction_response(
     response_text: str,
     id_mapping: dict[str, str],
+    *,
+    silent: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Parse and validate the LLM's extraction response.
 
@@ -1023,14 +1025,14 @@ def parse_extraction_response(
         Tuple of (actions, store_artifact):
         - actions: List of validated memory action dicts, each with:
           - text: str
-          - action: "ADD" | "UPDATE" | "DELETE"
-          - target_id: str | None (real UUID for UPDATE/DELETE)
+          - action: "ADD" | "UPDATE" | "CONFIRM"
+          - target_id: str | None (real UUID for UPDATE/CONFIRM)
           - old_memory: str | None
           - memory_type: str
           - categories: list[str]
           - importance: str
           - pinned: bool
-          NONE actions are filtered out. Invalid entries are skipped
+          SKIP actions are filtered out. Invalid entries fail closed
           with warnings.
         - store_artifact: bool — whether the LLM recommends preserving
           the original content as an artifact. Defaults to False if
@@ -1041,14 +1043,16 @@ def parse_extraction_response(
     try:
         data = parse_json_response(response_text)
     except ValueError:
-        logger.warning("Failed to parse extraction response, returning empty list")
+        if not silent:
+            logger.warning("Failed to parse extraction response, returning empty list")
         return [], False
 
     store_artifact = bool(data.get("store_artifact", False))
 
     raw_memories = data.get("memories", [])
     if not isinstance(raw_memories, list):
-        logger.warning("'memories' is not a list in extraction response")
+        if not silent:
+            logger.warning("'memories' is not a list in extraction response")
         return [], store_artifact
 
     results = []
@@ -1059,34 +1063,41 @@ def parse_extraction_response(
         action = entry.get("action", "").upper()
         text = entry.get("text", "").strip()
 
-        # Skip NONE actions and empty text
-        if action == "NONE" or not text:
+        aliases = {
+            "NONE": "SKIP",
+            "DUPLICATE": "SKIP",
+            "ALREADY_KNOWN": "SKIP",
+            "VALIDATE": "CONFIRM",
+            "VALIDATED": "CONFIRM",
+            "CONFIRMED": "CONFIRM",
+        }
+        action = aliases.get(action, action)
+        if not text:
             continue
-
         # Validate action
-        if action not in ("ADD", "UPDATE", "DELETE"):
-            logger.warning(
-                "Invalid action '%s' in extraction response, skipping", action
-            )
-            continue
+        if action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
+            if not silent:
+                logger.warning(
+                    "Invalid action '%s' in extraction response; failing closed", action
+                )
+            return [], store_artifact
 
         # Map target_id back to real UUID
         target_id = None
-        if action in ("UPDATE", "DELETE"):
+        if action in ("UPDATE", "CONFIRM"):
             raw_target = entry.get("target_id")
             if raw_target is not None:
                 raw_target = str(raw_target)
                 target_id = id_mapping.get(raw_target)
                 if target_id is None:
-                    logger.warning(
-                        "Unknown target_id '%s' in extraction response, "
-                        "skipping %s action",
-                        raw_target,
-                        action,
-                    )
+                    if not silent:
+                        logger.warning(
+                            "Unknown target_id in extraction response; skipping action"
+                        )
                     continue
             else:
-                logger.warning("%s action without target_id, skipping", action)
+                if not silent:
+                    logger.warning("Action without target_id, skipping")
                 continue
 
         # Validate and sanitize classification fields
@@ -1113,6 +1124,7 @@ def parse_extraction_response(
                 "importance": importance,
                 "pinned": pinned,
                 "event_date": event_date,
+                "_candidate_validated": action in ("UPDATE", "CONFIRM"),
             }
         )
 
@@ -3262,6 +3274,8 @@ def _build_session_context_section(
 
 def parse_remember_extraction_response(
     response_text: str,
+    *,
+    silent: bool = False,
 ) -> tuple[list[dict[str, Any]], str, bool]:
     """Parse Stage 1 remember extraction response.
 
@@ -3280,11 +3294,10 @@ def parse_remember_extraction_response(
     try:
         data = parse_json_response(response_text)
     except ValueError:
-        logger.warning(
-            "Failed to parse remember extraction response, returning empty. "
-            "Response (first 500 chars): %s",
-            response_text[:500],
-        )
+        if not silent:
+            logger.warning(
+                "Failed to parse remember extraction response, returning empty"
+            )
         return [], "", False
 
     summary = str(data.get("summary", "")).strip()
@@ -3292,7 +3305,8 @@ def parse_remember_extraction_response(
 
     raw_memories = data.get("memories", [])
     if not isinstance(raw_memories, list):
-        logger.warning("'memories' is not a list in remember extraction response")
+        if not silent:
+            logger.warning("'memories' is not a list in remember extraction response")
         return [], summary, store_artifact
 
     facts = []
@@ -3332,12 +3346,10 @@ def parse_remember_extraction_response(
             if raw_role in ("user", "assistant"):
                 fact["role"] = raw_role
             else:
-                logger.warning(
-                    "Auto extraction returned invalid role '%s' for fact "
-                    "'%.80s', defaulting to 'user'",
-                    raw_role,
-                    text,
-                )
+                if not silent:
+                    logger.warning(
+                        "Auto extraction returned invalid role; defaulting to user"
+                    )
                 fact["role"] = "user"
 
         facts.append(fact)
@@ -3350,7 +3362,7 @@ def parse_remember_extraction_response(
 
 _DEDUP_SYSTEM_PROMPT = """\
 You are a memory deduplication system. You receive a list of newly
-extracted facts and, for each fact, a list of similar existing memories
+ extracted facts and, for each fact, a list of similar existing memories
 from the database. Your job is to decide what to do with each fact.
 
 ## Security
@@ -3366,10 +3378,10 @@ For each fact, choose ONE action:
 - **UPDATE**: The fact modifies, enriches, or replaces an existing memory.
   Set target_id to the existing memory's ID. The text field should contain
   the NEW, updated content (merged with the existing memory if appropriate).
-- **DELETE**: The fact contradicts an existing memory that should be removed.
-  Set target_id to the existing memory's ID.
+- **CONFIRM**: The fact says the same thing as an existing memory and comes
+  from new user evidence. Set target_id to the existing memory's ID.
 - **SKIP**: The fact is already fully captured by an existing memory.
-  The existing memory already says the same thing. Do NOT re-add it.
+  Use this for assistant text, summaries, recalled text, or repeated evidence.
 
 **CRITICAL**: When an existing memory already captures the same information
 as the extracted fact (same meaning, same subject), you MUST use SKIP.
@@ -3438,12 +3450,12 @@ DEDUP_SCHEMA: dict[str, Any] = {
                         },
                         "action": {
                             "type": "string",
-                            "enum": ["ADD", "UPDATE", "DELETE", "SKIP"],
+                            "enum": ["ADD", "UPDATE", "CONFIRM", "SKIP"],
                         },
                         "target_id": {
                             "type": ["string", "null"],
                             "description": (
-                                "ID of existing memory for UPDATE/DELETE, "
+                                "ID of existing memory for UPDATE/CONFIRM, "
                                 "null for ADD/SKIP"
                             ),
                         },
@@ -3452,7 +3464,7 @@ DEDUP_SCHEMA: dict[str, Any] = {
                             "description": (
                                 "Final memory text. For ADD: the extracted "
                                 "fact. For UPDATE: the merged/updated text. "
-                                "For DELETE/SKIP: the existing memory text."
+                                "For CONFIRM/SKIP: the existing memory text."
                             ),
                         },
                     },
@@ -3480,7 +3492,7 @@ def build_dedup_prompt(
         Tuple of (messages, json_schema, id_mapping).
         id_mapping maps integer string IDs to real UUIDs.
     """
-    id_mapping: dict[str, str] = {}
+    id_mapping: dict[str, Any] = {}
     id_counter = 0
 
     parts = []
@@ -3496,7 +3508,10 @@ def build_dedup_prompt(
             cand_mapped = []
             for cand in candidates:
                 str_id = str(id_counter)
-                id_mapping[str_id] = cand["id"]
+                id_mapping[str_id] = {
+                    "memory_id": cand["id"],
+                    "fact_index": idx,
+                }
                 cand_mapped.append(
                     {
                         "id": str_id,
@@ -3510,7 +3525,7 @@ def build_dedup_prompt(
         else:
             parts.append(f"{fact_line}\nSimilar existing memories: none")
 
-    user_content = "\n\n".join(parts)
+    user_content = wrap_with_boundary("\n\n".join(parts), "existing_memories")
 
     system_prompt = _DEDUP_SYSTEM_PROMPT.format(
         anti_injection=ANTI_INJECTION_PREAMBLE,
@@ -3526,8 +3541,10 @@ def build_dedup_prompt(
 
 def parse_dedup_response(
     response_text: str,
-    id_mapping: dict[str, str],
+    id_mapping: dict[str, Any],
     facts: list[dict[str, Any]],
+    *,
+    silent: bool = False,
 ) -> tuple[list[dict[str, Any]], set[int]]:
     """Parse Stage 2 dedup response.
 
@@ -3553,12 +3570,18 @@ def parse_dedup_response(
     try:
         data = parse_json_response(response_text)
     except ValueError:
-        logger.warning("Failed to parse dedup response, returning empty list")
+        if not silent:
+            logger.warning("Failed to parse dedup response, returning empty list")
         return [], set()
 
+    if not isinstance(data, dict):
+        if not silent:
+            logger.warning("Dedup response is not an object")
+        return [], set()
     raw_decisions = data.get("decisions", [])
     if not isinstance(raw_decisions, list):
-        logger.warning("'decisions' is not a list in dedup response")
+        if not silent:
+            logger.warning("'decisions' is not a list in dedup response")
         return [], set()
 
     # Build fact index lookup
@@ -3566,44 +3589,79 @@ def parse_dedup_response(
 
     results = []
     decided_indices: set[int] = set()
+    mutation_targets: set[str] = set()
 
     for entry in raw_decisions:
         if not isinstance(entry, dict):
-            continue
+            return [], set()
 
-        action = entry.get("action", "").upper()
+        raw_action = entry.get("action")
         fact_index = entry.get("fact_index")
-        text = (entry.get("text") or "").strip()
+        raw_text = entry.get("text")
+        if not isinstance(raw_action, str) or not isinstance(raw_text, str):
+            if not silent:
+                logger.warning("Invalid field type in dedup response")
+            return [], set()
+        aliases = {
+            "NONE": "SKIP",
+            "DUPLICATE": "SKIP",
+            "ALREADY_KNOWN": "SKIP",
+            "VALIDATE": "CONFIRM",
+            "VALIDATED": "CONFIRM",
+            "CONFIRMED": "CONFIRM",
+        }
+        action = aliases.get(raw_action.upper(), raw_action.upper())
+        text = raw_text.strip()
 
-        # Track all fact indices the LLM addressed (including SKIPs)
-        if isinstance(fact_index, int):
-            decided_indices.add(fact_index)
+        if (
+            not isinstance(fact_index, int)
+            or fact_index not in fact_by_index
+            or fact_index in decided_indices
+        ):
+            if not silent:
+                logger.warning("Invalid or duplicate fact_index in dedup response")
+            return [], set()
 
-        # Skip SKIP actions (but we already tracked the index above)
-        if action == "SKIP" or not text:
-            continue
+        if not text or action not in ("ADD", "UPDATE", "CONFIRM", "SKIP"):
+            if not silent:
+                logger.warning("Invalid dedup decision for fact %d", fact_index)
+            return [], set()
 
-        if action not in ("ADD", "UPDATE", "DELETE"):
-            logger.warning("Invalid action '%s' in dedup response, skipping", action)
-            continue
+        raw_target = entry.get("target_id")
+        if action in ("ADD", "SKIP") and raw_target is not None:
+            if not silent:
+                logger.warning("%s action has unexpected target_id", action)
+            return [], set()
 
         # Map target_id back to real UUID
         target_id = None
-        if action in ("UPDATE", "DELETE"):
-            raw_target = entry.get("target_id")
+        if action in ("UPDATE", "CONFIRM"):
             if raw_target is not None:
                 raw_target = str(raw_target)
-                target_id = id_mapping.get(raw_target)
-                if target_id is None:
-                    logger.warning(
-                        "Unknown target_id '%s' in dedup response, skipping %s action",
-                        raw_target,
-                        action,
-                    )
-                    continue
+                target_entry = id_mapping.get(raw_target)
+                if isinstance(target_entry, dict):
+                    if target_entry.get("fact_index") != fact_index:
+                        if not silent:
+                            logger.warning("Cross-fact target_id in dedup response")
+                        return [], set()
+                    target_id = target_entry.get("memory_id")
+                else:
+                    target_id = target_entry
+                if not isinstance(target_id, str) or not target_id:
+                    if not silent:
+                        logger.warning(
+                            "Unknown target_id in dedup response, skipping action"
+                        )
+                    return [], set()
+                if target_id in mutation_targets:
+                    if not silent:
+                        logger.warning("Duplicate mutation target in dedup response")
+                    return [], set()
+                mutation_targets.add(target_id)
             else:
-                logger.warning("%s action without target_id, skipping", action)
-                continue
+                if not silent:
+                    logger.warning("Action without target_id, skipping")
+                return [], set()
 
         # Get metadata from the original Stage 1 fact
         fact = fact_by_index.get(fact_index, {}) if fact_index is not None else {}
@@ -3618,12 +3676,14 @@ def parse_dedup_response(
             "importance": fact.get("importance", "normal"),
             "pinned": fact.get("pinned", False),
             "event_date": fact.get("event_date"),
+            "_candidate_validated": action in ("UPDATE", "CONFIRM"),
         }
         # Carry per-fact role through the action dict (auto mode).
         # When present, this overrides the pipeline-level role.
         if "role" in fact:
             action_dict["role"] = fact["role"]
         results.append(action_dict)
+        decided_indices.add(fact_index)
 
     return results, decided_indices
 
@@ -4590,6 +4650,8 @@ When sources differ, use this order:
 - If a raw memory is already well-formed and durable, keep it as-is
 - Set pinned=false by default. Set pinned=true ONLY for essential long-lived
   identity facts, standing rules, or critical ongoing constraints.
+- Set source_ids to the exact source aliases that support each output.
+- Do not attach unrelated raw memories to an output.
 
 ## Attribution rules
 
@@ -4745,6 +4807,8 @@ When sources differ, use this order:
 - If a raw memory is already well-formed and durable, keep it as-is
 - Set pinned=false by default. Set pinned=true ONLY for essential long-lived
   identity facts, standing rules, or critical ongoing constraints.
+- Set source_ids to the exact source aliases that support each output.
+- Do not attach unrelated raw memories to an output.
 
 ## Attribution rules
 
@@ -4907,13 +4971,10 @@ CONSOLIDATION_OUTPUT_SCHEMA: dict[str, Any] = {
                         },
                         "memory_type": {
                             "type": "string",
-                            "enum": [
-                                "preference",
-                                "fact",
-                                "episodic",
-                                "procedural",
-                                "context",
-                            ],
+                            "description": (
+                                "Descriptive memory type. The server normalizes "
+                                "this value to a supported memory type."
+                            ),
                         },
                         "categories": {
                             "type": "array",
@@ -4930,6 +4991,14 @@ CONSOLIDATION_OUTPUT_SCHEMA: dict[str, Any] = {
                             "type": ["string", "null"],
                             "description": "ISO 8601 date (YYYY-MM-DD) when the event occurred, or null",
                         },
+                        "source_ids": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "Exact raw source aliases, such as S0. "
+                                "Use an empty array only for summary-only output."
+                            ),
+                        },
                     },
                     "required": [
                         "text",
@@ -4938,6 +5007,7 @@ CONSOLIDATION_OUTPUT_SCHEMA: dict[str, Any] = {
                         "importance",
                         "pinned",
                         "event_date",
+                        "source_ids",
                     ],
                     "additionalProperties": False,
                 },
@@ -4982,7 +5052,7 @@ def build_consolidation_prompt(
     """
     # Format raw memories as text (role is implicit — all same role)
     raw_lines = []
-    for mem in raw_memories:
+    for index, mem in enumerate(raw_memories):
         text = mem.get("memory", "") or mem.get("text", "")
         meta = mem.get("metadata") or {}
         mem_type = meta.get("memory_type", "unknown")
@@ -4996,7 +5066,7 @@ def build_consolidation_prompt(
         date_marker = f", date: {event_date}" if event_date else ""
 
         raw_lines.append(
-            f"- [{mem_type}, {importance}{date_marker}] {text}"
+            f"- [S{index}] [{mem_type}, {importance}{date_marker}] {text}"
             f" (categories: {cats or 'none'}){artifact_marker}"
         )
 

@@ -1476,6 +1476,62 @@ class TestApplyCheck:
         check.summary = FsckService._build_summary(issues)
         return check
 
+    def test_recovers_durable_plans_after_store_restart(self):
+        """A restarted worker must resume planned issues from Qdrant audit."""
+        service = _make_fsck_service()
+        memory_service = MagicMock()
+        service._memory_service = memory_service
+        memory_service.revisions.operations.list_fsck.return_value = [
+            {
+                "status": status,
+                "user_id": "filip",
+                "owner_id": "filip",
+                "agent_id": None,
+                "fsck_issue_id": f"issue-{index}",
+                "issue": {
+                    "issue_id": f"issue-{index}",
+                    "type": "quality",
+                    "severity": "medium",
+                    "reasoning": f"issue {index}",
+                    "affected_memories": [
+                        {
+                            "id": "mem-1",
+                            "content": "old",
+                            "metadata": {"revision": 1},
+                            "agent_id": None,
+                        }
+                    ],
+                    "actions": [
+                        {
+                            "action": "update",
+                            "memory_id": "mem-1",
+                            "new_content": f"fixed {index}",
+                            "new_metadata": None,
+                        }
+                    ],
+                    "confidence": 0.9,
+                },
+            }
+            for index, status in ((1, "committed"), (2, "planned"))
+        ]
+        memory_service.revisions.operations.get.return_value = {"status": "planned"}
+        service._vector.get_by_id.return_value = {
+            "id": "mem-1",
+            "user_id": "filip",
+            "owner_id": "filip",
+            "memory": "old",
+            "metadata": {"revision": 1},
+        }
+
+        recovered = service.get_check("check-restart", user_id="filip")
+        assert recovered is not None
+        assert recovered.applied_issue_ids == {"issue-1"}
+        result = service.apply_check("check-restart")
+
+        assert result["applied"] == 1
+        assert result["skipped"] == 1
+        memory_service.update_memory.assert_called_once()
+
     def test_apply_delete_action(self):
         svc = _make_fsck_service()
         issue = _make_issue(
@@ -1973,8 +2029,9 @@ class TestApplyCheck:
         check = self._make_completed_check(svc, [issue])
 
         result = svc.apply_check(check.check_id)
-        # Issue is "applied" (no exception) but the action was skipped internally
-        assert result["applied"] == 1
+        assert result["applied"] == 0
+        assert result["skipped"] == 1
+        assert result["details"][0]["status"] == "skipped"
         assert result["details"][0]["actions_executed"] == 0
         assert result["details"][0]["actions_skipped"] == 1
         svc._vector.delete.assert_not_called()
@@ -1993,7 +2050,9 @@ class TestApplyCheck:
         check = self._make_completed_check(svc, [issue])
 
         result = svc.apply_check(check.check_id)
-        assert result["applied"] == 1
+        assert result["applied"] == 0
+        assert result["skipped"] == 1
+        assert result["details"][0]["status"] == "skipped"
         assert result["details"][0]["actions_executed"] == 0
         assert result["details"][0]["actions_skipped"] == 1
         svc._vector.delete.assert_not_called()
@@ -2012,7 +2071,9 @@ class TestApplyCheck:
         check = self._make_completed_check(svc, [issue])
 
         result = svc.apply_check(check.check_id)
-        assert result["applied"] == 1
+        assert result["applied"] == 0
+        assert result["skipped"] == 1
+        assert result["details"][0]["status"] == "skipped"
         assert result["details"][0]["actions_executed"] == 0
         assert result["details"][0]["actions_skipped"] == 1
         svc._vector.update_content.assert_not_called()
@@ -2898,6 +2959,75 @@ class TestFsckApiEndpoints:
         # Background task should be scheduled
         bg.add_task.assert_called_once()
 
+    def test_start_exact_audit_passes_bound_targets_and_scope(self):
+        """The audit endpoint must bind exact revisions and schedule audit-only work."""
+        from mnemory.api.deps import SessionContext
+        from mnemory.api.fsck import start_fsck_audit
+        from mnemory.api.schemas import FsckAuditRequest
+
+        mock_fsck_service = MagicMock()
+        mock_fsck_service.start_exact_audit.return_value = FsckCheck(
+            check_id="audit-1",
+            user_id="user-1",
+            owner_id="owner-1",
+            mode="exact_audit",
+        )
+        request = FsckAuditRequest(
+            basis_operation_id="operation-1",
+            targets=[{"memory_id": "memory-1", "revision": 3}],
+        )
+        context = SessionContext(
+            user_id="user-1",
+            owner_id="owner-1",
+            agent_id="agent-1",
+        )
+        background = MagicMock()
+
+        with (
+            patch(
+                "mnemory.api.fsck._get_fsck_service",
+                return_value=mock_fsck_service,
+            ),
+            patch("mnemory.api.fsck._record"),
+        ):
+            response = start_fsck_audit(request, background, context)
+
+        assert response.check_id == "audit-1"
+        mock_fsck_service.start_exact_audit.assert_called_once_with(
+            basis_operation_id="operation-1",
+            targets=[{"memory_id": "memory-1", "revision": 3}],
+            user_id="user-1",
+            owner_id="owner-1",
+            session_agent_id="agent-1",
+        )
+        background.add_task.assert_called_once_with(
+            mock_fsck_service.run_exact_audit,
+            "audit-1",
+        )
+
+    def test_exact_audit_schema_rejects_duplicate_or_unbounded_targets(self):
+        """Audit target IDs must be unique and bounded."""
+        from pydantic import ValidationError
+
+        from mnemory.api.schemas import FsckAuditRequest
+
+        with pytest.raises(ValidationError):
+            FsckAuditRequest(
+                basis_operation_id="operation-1",
+                targets=[
+                    {"memory_id": "memory-1", "revision": 1},
+                    {"memory_id": "memory-1", "revision": 2},
+                ],
+            )
+        with pytest.raises(ValidationError):
+            FsckAuditRequest(
+                basis_operation_id="operation-1",
+                targets=[
+                    {"memory_id": f"memory-{index}", "revision": 1}
+                    for index in range(21)
+                ],
+            )
+
     def test_start_fsck_passes_include_raw(self):
         """REST start endpoint should thread include_raw into run_check."""
         from mnemory.api.deps import SessionContext
@@ -2951,6 +3081,7 @@ class TestFsckApiEndpoints:
 
         mock_fsck_service.start_check.assert_called_once_with(
             user_id="filip",
+            owner_id=None,
             agent_id="session-agent:bob",
         )
 
@@ -2998,6 +3129,7 @@ class TestFsckApiEndpoints:
 
         mock_fsck_service.start_check.assert_called_once_with(
             user_id="filip",
+            owner_id=None,
             agent_id="session-agent",
         )
 

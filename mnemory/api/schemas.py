@@ -12,6 +12,56 @@ from pydantic import BaseModel, Field, field_validator
 
 from mnemory.sanitize import escape_memory_headers
 
+
+class EvidenceActor(BaseModel):
+    """Authenticated actor supplied by Cognis."""
+
+    model_config = {"extra": "forbid"}
+
+    user_id: str = Field(..., min_length=1, max_length=256)
+    owner_id: str = Field(..., min_length=1, max_length=256)
+
+
+class EvidenceEvent(BaseModel):
+    """Stable event identity supplied by Cognis."""
+
+    model_config = {"extra": "forbid"}
+
+    id: str = Field(..., min_length=1, max_length=256)
+    event_hash: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    cognis_session_id: str = Field(..., min_length=1, max_length=256)
+    conversation_id: str = Field(..., min_length=1, max_length=256)
+    turn_id: str = Field(..., min_length=1, max_length=256)
+
+
+class EvidenceMessage(BaseModel):
+    """The single user message attached to an evidence event."""
+
+    model_config = {"extra": "forbid"}
+
+    role: Literal["user"]
+    content: str = Field(..., min_length=1, max_length=400_000)
+
+
+class EvidenceRememberRequest(BaseModel):
+    """Strict body contract for the trusted evidence endpoint."""
+
+    model_config = {"extra": "forbid"}
+
+    version: Literal[1]
+    actor: EvidenceActor
+    event: EvidenceEvent
+    messages: list[EvidenceMessage] = Field(..., min_length=1, max_length=1)
+
+    @field_validator("messages")
+    @classmethod
+    def validate_message(cls, value: list[EvidenceMessage]) -> list[EvidenceMessage]:
+        """Reject a structurally present but empty user message."""
+        if not value or not value[0].content.strip():
+            raise ValueError("Evidence message content must be non-empty")
+        return value
+
+
 # ── Memory CRUD ───────────────────────────────────────────────────────
 
 
@@ -83,11 +133,15 @@ class DeleteMemoriesBatchRequest(BaseModel):
 
 
 class MemoryActionResult(BaseModel):
-    """Result of a single memory action (ADD, UPDATE, DELETE)."""
+    """Result of one inferred ADD, UPDATE, CONFIRM, or SKIP action."""
 
-    id: str
+    id: str | None = None
     memory: str
-    event: str  # ADD, UPDATE, DELETE
+    event: str
+    operation_id: str | None = None
+    lineage_id: str | None = None
+    revision: int | None = None
+    replayed: bool = False
 
 
 class ArtifactInfo(BaseModel):
@@ -226,6 +280,67 @@ class ListMemoriesResponse(BaseModel):
     """Response from listing memories."""
 
     results: list[MemoryItem]
+    next_cursor: str | None = None
+    has_more: bool = False
+
+
+class HistoryRevisionItem(BaseModel):
+    """UI-safe immutable revision."""
+
+    id: str
+    memory: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    has_artifacts: bool = False
+    predecessor_id: str | None = None
+    successor_id: str | None = None
+
+
+class HistoryOperationItem(BaseModel):
+    """UI-safe audit event without internal retry or transition data."""
+
+    operation_id: str | None = None
+    operation_kind: str
+    status: str
+    actor_kind: str | None = None
+    source_kind: str | None = None
+    reason: str | None = None
+    created_at_utc: str | None = None
+    completed_at_utc: str | None = None
+
+
+class MemoryHistoryResponse(BaseModel):
+    """Authorized immutable lineage history."""
+
+    lineage_id: str
+    current_revision_id: str | None = None
+    revisions: list[HistoryRevisionItem] = Field(default_factory=list)
+    operations: list[HistoryOperationItem] = Field(default_factory=list)
+    next_revision_cursor: str | None = None
+    next_operation_cursor: str | None = None
+
+
+class MemoryLinkItem(BaseModel):
+    """UI-safe authorized related revision."""
+
+    id: str
+    memory: str
+    revision: int
+    revision_state: str
+    memory_type: str | None = None
+    memory_layer: str
+    has_artifacts: bool = False
+
+
+class MemoryLinksResponse(BaseModel):
+    """Authorized provenance and supersession relationships."""
+
+    revision_id: str
+    lineage_id: str
+    supersedes: MemoryLinkItem | None = None
+    successor: MemoryLinkItem | None = None
+    derived_from: list[MemoryLinkItem] = Field(default_factory=list)
+    derived_outputs: list[MemoryLinkItem] = Field(default_factory=list)
+    provenance_quality: str = "exact"
 
 
 class GetMemoriesByIdsRequest(BaseModel):
@@ -279,6 +394,17 @@ class UpdateMemoryRequest(BaseModel):
             "Null (omitted) means no change. When session has an agent_id, "
             "only own agent_id or clearing is allowed."
         ),
+    )
+    expected_revision: int | None = Field(
+        None,
+        ge=1,
+        description="Expected active revision. A mismatch returns HTTP 409.",
+    )
+    idempotency_key: str | None = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="Retry key scoped to this lineage and update operation.",
     )
 
 
@@ -578,6 +704,33 @@ class FsckRequest(BaseModel):
     )
 
 
+class FsckAuditTarget(BaseModel):
+    """One exact revision requested for an audit-only fsck."""
+
+    model_config = {"extra": "forbid"}
+
+    memory_id: str = Field(..., min_length=1, max_length=128)
+    revision: int = Field(..., ge=1)
+
+
+class FsckAuditRequest(BaseModel):
+    """Request a bounded, operation-bound, mutation-free fsck audit."""
+
+    model_config = {"extra": "forbid"}
+
+    basis_operation_id: str = Field(..., min_length=1, max_length=128)
+    targets: list[FsckAuditTarget] = Field(..., min_length=1, max_length=20)
+
+    @field_validator("targets")
+    @classmethod
+    def targets_are_unique(cls, value: list[FsckAuditTarget]):
+        """Reject duplicate IDs instead of silently changing audit scope."""
+        ids = [target.memory_id for target in value]
+        if len(ids) != len(set(ids)):
+            raise ValueError("Audit target memory IDs must be unique")
+        return value
+
+
 class FsckStartResponse(BaseModel):
     """Response from starting a memory check."""
 
@@ -667,6 +820,8 @@ class FsckStatusResponse(BaseModel):
     error: str | None = None
     created_at: str | None = None
     expires_at: str | None = None
+    mode: Literal["scan", "exact_audit"] = "scan"
+    target_state: Literal["complete", "absent", "stale"] | None = None
 
 
 class FsckApplyRequest(BaseModel):
@@ -694,6 +849,35 @@ class FsckApplyResponse(BaseModel):
     skipped: int = 0
     failed: int = 0
     details: list[FsckApplyDetail] = Field(default_factory=list)
+
+
+class FsckReEvaluateRequest(BaseModel):
+    """Compare an old fsck operation with a separately generated check."""
+
+    fresh_check_id: str = Field(..., min_length=1)
+    terminalize: bool = False
+
+
+class FsckReEvaluateResponse(BaseModel):
+    """Non-content result of fsck operation re-evaluation."""
+
+    operation_id: str
+    outcome: str
+    terminalized: bool
+    old_action_count: int
+    fresh_action_count: int
+    stale_target_count: int
+    fresh_check_id: str
+    fresh_issue_id: str | None = None
+
+
+class FailedSessionRetryRequest(BaseModel):
+    """Bounded explicit retry request for failed sessions."""
+
+    session_ids: list[str] = Field(..., min_length=1, max_length=10)
+    dry_run: bool = True
+    idempotency_key: str | None = Field(None, min_length=1, max_length=256)
+    stop_on_failure: bool = True
 
 
 # ── Download Tokens ───────────────────────────────────────────────────

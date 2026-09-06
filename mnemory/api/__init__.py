@@ -108,6 +108,15 @@ def _add_openapi_security(spec: dict[str, Any]) -> dict[str, Any]:
             "description": "mnemory API key",
         },
     )
+    security_schemes.setdefault(
+        "CognisEvidence",
+        {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "Cognis ES256 user-event JWT; evidence route only",
+        },
+    )
 
     public_operations = {("/auth/exchange", "post")}
     for path, methods in spec.get("paths", {}).items():
@@ -118,6 +127,8 @@ def _add_openapi_security(spec: dict[str, Any]) -> dict[str, Any]:
                 continue
             if (path, method.lower()) in public_operations:
                 operation.setdefault("security", [])
+            elif path == "/evidence/remember/v1":
+                operation["security"] = [{"CognisEvidence": []}]
             else:
                 operation.setdefault(
                     "security",
@@ -160,6 +171,7 @@ def create_api_app() -> FastAPI:
     )
 
     from mnemory.api.auth import router as auth_router
+    from mnemory.api.evidence import router as evidence_router
     from mnemory.api.fsck import router as fsck_router
     from mnemory.api.memories import categories_router
     from mnemory.api.memories import router as memories_router
@@ -169,6 +181,7 @@ def create_api_app() -> FastAPI:
     from mnemory.api.ui import router as ui_router
 
     app.include_router(auth_router, tags=["auth"])
+    app.include_router(evidence_router, tags=["evidence"])
     app.include_router(memories_router, prefix="/memories", tags=["memories"])
     app.include_router(categories_router, prefix="/categories", tags=["categories"])
     app.include_router(recall_router, tags=["intelligence"])

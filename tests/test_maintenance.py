@@ -672,7 +672,7 @@ class TestMetricsAutofsck:
         assert totals["fixes_failed"] == 1
 
 
-def test_gc_uses_lightweight_metadata_scan_and_preserves_eligibility() -> None:
+def test_raw_evidence_gc_is_disabled() -> None:
     vector = MagicMock()
     old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
     vector.scroll_gc_metadata.return_value = [
@@ -696,10 +696,10 @@ def test_gc_uses_lightweight_metadata_scan_and_preserves_eligibility() -> None:
         },
     ]
 
-    assert gc_superseded_raw(vector, "filip") == {"deleted": 1}
-    vector.scroll_gc_metadata.assert_called_once_with(user_id="filip")
+    assert gc_superseded_raw(vector, "filip") == {"deleted": 0}
+    vector.scroll_gc_metadata.assert_not_called()
     vector.scroll_with_vectors.assert_not_called()
-    vector.delete.assert_called_once_with("eligible")
+    vector.delete.assert_not_called()
 
 
 def test_gc_metadata_scan_requests_exact_fields_without_vectors() -> None:

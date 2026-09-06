@@ -7,6 +7,22 @@
  * - notify: toast notification system
  */
 
+function trapModalFocus(event) {
+  const focusable = [...event.currentTarget.querySelectorAll(
+    'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex="0"]'
+  )].filter((element) => element.offsetParent !== null);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 document.addEventListener('alpine:init', () => {
 
   // ── Auth Store ───────────────────────────────────────────────
@@ -170,16 +186,18 @@ document.addEventListener('alpine:init', () => {
     memory: null,   // original memory object
     form: {},       // editable copy
     _onSaved: null, // callback(updatedFields) after successful save
+    _returnFocus: null,
 
     /**
      * Open the edit modal for a memory.
      * @param {object} memory - The memory object to edit.
      * @param {function} onSaved - Called with updated field map after save.
      */
-    show(memory, onSaved) {
+    show(memory, onSaved, returnFocus = null) {
       const meta = memory.metadata || {};
       this.memory = memory;
       this._onSaved = onSaved || null;
+      this._returnFocus = returnFocus || document.activeElement;
       this.form = {
         content: memory.memory || '',
         memory_type: meta.memory_type || '',
@@ -192,12 +210,21 @@ document.addEventListener('alpine:init', () => {
         labels: JSON.stringify(meta.labels || {}, null, 0),
       };
       this.open = true;
+      setTimeout(() => {
+        document.querySelector('[data-memory-edit-modal] textarea')?.focus();
+      }, 200);
     },
 
     close() {
       this.open = false;
       this.memory = null;
       this._onSaved = null;
+      requestAnimationFrame(() => this._returnFocus?.focus());
+      this._returnFocus = null;
+    },
+
+    trapFocus(event) {
+      trapModalFocus(event);
     },
 
     async save() {
@@ -245,11 +272,19 @@ document.addEventListener('alpine:init', () => {
       if (Object.keys(payload).length === 0) { this.close(); return; }
 
       try {
-        await MnemoryAPI.updateMemory(memoryId, payload);
-        if (this._onSaved) this._onSaved(payload);
-        Alpine.store('notify').success('Memory updated');
+        const result = await MnemoryAPI.updateMemory(memoryId, payload, meta.revision);
+        if (this._onSaved) this._onSaved(result);
+        Alpine.store('notify').success('A successor revision was created');
         this.close();
       } catch (err) {
+        if (err.status === 409) {
+          window.dispatchEvent(new CustomEvent('mnemory:stale-revision', {
+            detail: err.detail || {},
+          }));
+          Alpine.store('notify').warning('A newer revision exists. The view was refreshed.');
+          this.close();
+          return;
+        }
         Alpine.store('notify').error(`Failed to update: ${err.message}`);
       }
     },
@@ -259,7 +294,9 @@ document.addEventListener('alpine:init', () => {
   // Global artifact modal — shared between Memories and Search tabs.
   Alpine.store('artifactMgr', {
     open: false,
+    _returnFocus: null,
     memoryId: null,
+    revision: null,
     memoryText: '',
     artifacts: [],
     loading: false,
@@ -288,20 +325,32 @@ document.addEventListener('alpine:init', () => {
      * Open the artifact manager for a memory.
      * @param {object} memory - Memory object with id and memory text.
      */
-    show(memory) {
+    show(memory, returnFocus = null) {
+      this._returnFocus = returnFocus || document.activeElement;
       this.memoryId = memory.id;
+      this.revision = memory.metadata?.revision || null;
       this.memoryText = memory.memory || '';
       this.artifacts = [];
       this.deleteConfirm = null;
       this.view = { open: false, artifact: null, content: '', hasMore: false, offset: 0, loading: false };
       this.addForm = { open: false, saving: false, filename: 'note.md', content_type: 'text/markdown', content: '' };
       this.open = true;
+      setTimeout(() => {
+        document.querySelector('[data-artifact-modal] button')?.focus();
+      }, 200);
       this.loadArtifacts();
     },
 
     close() {
       this.open = false;
       this.memoryId = null;
+      this.revision = null;
+      requestAnimationFrame(() => this._returnFocus?.focus());
+      this._returnFocus = null;
+    },
+
+    trapFocus(event) {
+      trapModalFocus(event);
     },
 
     async loadArtifacts() {
@@ -380,7 +429,7 @@ document.addEventListener('alpine:init', () => {
           content: f.content,
           filename: f.filename || 'note.md',
           content_type: f.content_type || 'text/markdown',
-        });
+        }, this.revision);
         // result is the artifact metadata
         this.artifacts.push(result);
         f.open = false;
@@ -389,6 +438,14 @@ document.addEventListener('alpine:init', () => {
         f.content_type = 'text/markdown';
         Alpine.store('notify').success('Artifact saved');
       } catch (err) {
+        if (err.status === 409) {
+          window.dispatchEvent(new CustomEvent('mnemory:stale-revision', {
+            detail: err.detail || {},
+          }));
+          this.close();
+          Alpine.store('notify').warning('A newer revision exists. The view was refreshed.');
+          return;
+        }
         Alpine.store('notify').error(`Failed to save artifact: ${err.message}`);
       } finally {
         f.saving = false;
@@ -397,7 +454,7 @@ document.addEventListener('alpine:init', () => {
 
     async deleteArtifact(artifactId) {
       try {
-        await MnemoryAPI.deleteArtifact(this.memoryId, artifactId);
+        await MnemoryAPI.deleteArtifact(this.memoryId, artifactId, this.revision);
         this.artifacts = this.artifacts.filter(a => a.id !== artifactId);
         this.deleteConfirm = null;
         // Close view panel if we just deleted the viewed artifact
@@ -406,6 +463,14 @@ document.addEventListener('alpine:init', () => {
         }
         Alpine.store('notify').success('Artifact deleted');
       } catch (err) {
+        if (err.status === 409) {
+          window.dispatchEvent(new CustomEvent('mnemory:stale-revision', {
+            detail: err.detail || {},
+          }));
+          this.close();
+          Alpine.store('notify').warning('A newer revision exists. The view was refreshed.');
+          return;
+        }
         this.deleteConfirm = null;
         Alpine.store('notify').error(`Failed to delete artifact: ${err.message}`);
       }

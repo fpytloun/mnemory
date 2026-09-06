@@ -8,7 +8,10 @@ fall back to existing API key authentication when validation fails.
 from __future__ import annotations
 
 import logging
+import re
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import jwt
 from jwt import InvalidTokenError, PyJWKClient
@@ -19,6 +22,8 @@ _EXPECTED_ISSUER = "cognis"
 _EXPECTED_AUDIENCE = "mnemory"
 _JWKS_CACHE_TTL_SECONDS = 300
 _JWKS_TIMEOUT_SECONDS = 5
+_EVIDENCE_SKEW_SECONDS = 5
+_EVIDENCE_MAX_LIFETIME_SECONDS = 60
 
 
 @dataclass(frozen=True)
@@ -28,6 +33,8 @@ class JWTAuthContext:
     user_id: str
     agent_id: str | None = None
     owner_id: str | None = None
+    token_type: str | None = None
+    scopes: frozenset[str] = frozenset()
 
 
 class CognisJWTValidator:
@@ -77,6 +84,18 @@ class CognisJWTValidator:
         claim_owner_id = claims.get("aow")
         if claim_owner_id is not None and not isinstance(claim_owner_id, str):
             raise InvalidTokenError("JWT aow claim must be a string when present")
+        token_type = claims.get("typ")
+        if token_type is not None and not isinstance(token_type, str):
+            raise InvalidTokenError("JWT typ claim must be a string when present")
+        raw_scope = claims.get("scope", "")
+        if isinstance(raw_scope, str):
+            scopes = frozenset(raw_scope.split())
+        elif isinstance(raw_scope, list) and all(
+            isinstance(item, str) for item in raw_scope
+        ):
+            scopes = frozenset(raw_scope)
+        else:
+            raise InvalidTokenError("JWT scope claim must be a string or string list")
 
         if claim_agent_id and header_agent_id and claim_agent_id != header_agent_id:
             raise InvalidTokenError("X-Agent-Id does not match JWT agent_id claim")
@@ -87,6 +106,8 @@ class CognisJWTValidator:
             user_id=user_id,
             agent_id=claim_agent_id or header_agent_id,
             owner_id=claim_owner_id or header_owner_id or user_id,
+            token_type=token_type,
+            scopes=scopes,
         )
 
     def decode_claims(self, token: str) -> dict:
@@ -101,6 +122,86 @@ class CognisJWTValidator:
                 wrong issuer/audience.
         """
         return self._decode(token)
+
+    def validate_evidence(
+        self, token: str, *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Validate the dedicated, non-fallback Cognis evidence token."""
+        header = jwt.get_unverified_header(token)
+        if header.get("alg") != "ES256":
+            raise InvalidTokenError("Invalid evidence token header")
+        claims = self._decode_evidence(token)
+        stable_strings = (
+            "typ",
+            "scope",
+            "evop",
+            "sub",
+            "evt",
+            "event_hash",
+            "request_hash",
+            "evidence_root",
+            "cognis_session_id",
+            "conversation_id",
+            "turn_id",
+            "jti",
+        )
+        for name in stable_strings:
+            value = claims.get(name)
+            if not isinstance(value, str) or not value.strip():
+                raise InvalidTokenError(f"Evidence token is missing {name}")
+        for name in (
+            "sub",
+            "evt",
+            "cognis_session_id",
+            "conversation_id",
+            "turn_id",
+            "jti",
+        ):
+            if len(claims[name]) > 256:
+                raise InvalidTokenError(f"Evidence {name} exceeds its size limit")
+        if claims["typ"] != "user_event":
+            raise InvalidTokenError("Invalid evidence token type")
+        if claims["scope"] != "mnemory:evidence":
+            raise InvalidTokenError("Invalid evidence scope")
+        if claims["evop"] != "remember" or claims.get("ver") != 1:
+            raise InvalidTokenError("Invalid evidence operation")
+        if not isinstance(claims.get("ver"), int) or isinstance(claims["ver"], bool):
+            raise InvalidTokenError("Invalid evidence version")
+        if not isinstance(claims.get("aow"), str) or not claims["aow"].strip():
+            raise InvalidTokenError("Evidence token requires non-empty aow")
+        if "agent_id" in claims:
+            raise InvalidTokenError("Evidence tokens cannot contain agent_id")
+        for name in ("event_hash", "request_hash", "evidence_root"):
+            if not re.fullmatch(r"[0-9a-f]{64}", claims[name]):
+                raise InvalidTokenError(f"Evidence {name} must be lowercase SHA-256")
+        for name in ("iat", "nbf", "exp"):
+            value = claims.get(name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise InvalidTokenError(f"Evidence token requires numeric {name}")
+        current = time.time() if now is None else now
+        if claims["exp"] - claims["iat"] > _EVIDENCE_MAX_LIFETIME_SECONDS:
+            raise InvalidTokenError("Evidence token lifetime exceeds 60 seconds")
+        if claims["nbf"] > claims["iat"]:
+            raise InvalidTokenError("Evidence nbf cannot follow iat")
+        if claims["iat"] > current + _EVIDENCE_SKEW_SECONDS:
+            raise InvalidTokenError("Evidence token iat is in the future")
+        if claims["exp"] < current - _EVIDENCE_SKEW_SECONDS:
+            raise InvalidTokenError("Evidence token is expired")
+        if "nbf" in claims and claims["nbf"] > current + _EVIDENCE_SKEW_SECONDS:
+            raise InvalidTokenError("Evidence token is not yet valid")
+        return claims
+
+    def is_evidence_intent(self, token: str) -> bool:
+        """Classify a validly signed evidence-capable token before fallback."""
+        try:
+            claims = self._decode_signature_only(token)
+        except InvalidTokenError:
+            return False
+        return (
+            claims.get("typ") == "user_event"
+            or claims.get("scope") == "mnemory:evidence"
+            or claims.get("evop") == "remember"
+        )
 
     def _decode(self, token: str) -> dict:
         if self._public_key is not None:
@@ -132,14 +233,83 @@ class CognisJWTValidator:
 
         raise InvalidTokenError("JWT validation failed") from last_error
 
+    def _decode_evidence(self, token: str) -> dict:
+        """Decode an evidence token with the dedicated five-second skew."""
+        if self._public_key is not None:
+            return self._decode_with_key(
+                token,
+                self._public_key,
+                leeway=5,
+                required=("iss", "aud", "iat", "nbf", "exp"),
+            )
+        try:
+            key = self._get_jwks_client(False).get_signing_key_from_jwt(token).key
+            return self._decode_with_key(
+                token,
+                key,
+                leeway=5,
+                required=("iss", "aud", "iat", "nbf", "exp"),
+            )
+        except InvalidTokenError:
+            raise
+        except Exception as exc:
+            raise InvalidTokenError("Failed to resolve JWT signing key") from exc
+
+    def _decode_signature_only(self, token: str) -> dict:
+        """Verify only ES256 signature for pre-fallback intent classification."""
+        if self._public_key is not None:
+            return jwt.decode(
+                token,
+                self._public_key,
+                algorithms=["ES256"],
+                options={
+                    "verify_exp": False,
+                    "verify_nbf": False,
+                    "verify_aud": False,
+                    "verify_iss": False,
+                },
+            )
+        last_error: Exception | None = None
+        for force_refresh in (False, True):
+            try:
+                key = (
+                    self._get_jwks_client(force_refresh)
+                    .get_signing_key_from_jwt(token)
+                    .key
+                )
+                return jwt.decode(
+                    token,
+                    key,
+                    algorithms=["ES256"],
+                    options={
+                        "verify_exp": False,
+                        "verify_nbf": False,
+                        "verify_aud": False,
+                        "verify_iss": False,
+                    },
+                )
+            except Exception as exc:
+                last_error = exc
+                if force_refresh:
+                    break
+        raise InvalidTokenError("Evidence intent classification failed") from last_error
+
     @staticmethod
-    def _decode_with_key(token: str, key: object) -> dict:
+    def _decode_with_key(
+        token: str,
+        key: object,
+        *,
+        leeway: int = 0,
+        required: tuple[str, ...] = (),
+    ) -> dict:
         return jwt.decode(
             token,
             key,
             algorithms=["ES256"],
             issuer=_EXPECTED_ISSUER,
             audience=_EXPECTED_AUDIENCE,
+            leeway=leeway,
+            options={"require": list(required)},
         )
 
     def _get_jwks_client(self, force_refresh: bool = False) -> PyJWKClient:

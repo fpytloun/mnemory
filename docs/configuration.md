@@ -105,6 +105,24 @@ EMBED_BASE_URL=https://api.openai.com/v1
 | `TTL_PROCEDURAL` | `60` | Default TTL in days for `procedural` memories |
 | `TTL_CONTEXT` | `7` | Default TTL in days for `context` memories |
 | `TRACK_MEMORY_ACCESS` | `true` | Update last_accessed_at and reset TTL on search/recall |
+| `VALIDATION_ENABLED` | `true` | Accept independent user evidence as a confirmation during inferred deduplication |
+| `VALIDATION_MAX_SCORE_ROOTS` | `3` | Maximum confirmation roots that affect the ranking boost |
+| `VALIDATION_MAX_SCORE_BOOST` | `0.10` | Maximum multiplicative ranking boost from confirmations |
+| `VALIDATION_TTL_MULTIPLIER` | `2.0` | TTL extension multiplier for a new independent confirmation |
+| `SLOW_DECAY_ENABLED` | `false` | Gradually reduce ranking before hard expiry |
+| `SLOW_DECAY_HALF_LIFE_DAYS` | `30` | Base ranking half-life when slow decay is enabled |
+| `SLOW_DECAY_SCORE_FLOOR` | `0.25` | Minimum slow-decay multiplier |
+| `SLOW_DECAY_VALIDATION_HALF_LIFE_MULTIPLIER` | `2.0` | Maximum half-life multiplier from validation |
+| `SLOW_DECAY_CANDIDATE_MULTIPLIER` | `3` | Bounded retrieval overfetch before post-ranking |
+| `FSCK_RECOVERY_LEASE_SECONDS` | `300` | Lease duration for one fsck operation recovery |
+| `FSCK_RECOVERY_MAX_ATTEMPTS` | `3` | Maximum recovery attempts per fsck operation |
+| `FSCK_STRANDED_AFTER_SECONDS` | `3600` | Age threshold for stranded-operation metrics |
+| `LEGACY_FAILED_RETRY_ENABLED` | `false` | Permit explicit mutation of legacy failed sessions |
+| `LEGACY_FAILED_RETRY_MAX_BATCH` | `10` | Hard upper bound for one retry batch |
+| `LEGACY_FAILED_RETRY_MAX_RAW_MEMORIES` | `100` | Maximum raw memories in an eligible session |
+| `LEGACY_FAILED_RETRY_STOP_FAILURE_RATIO` | `0.20` | Failure-ratio stop threshold |
+| `LEGACY_FAILED_RETRY_STOP_MIN_ATTEMPTS` | `5` | Minimum attempts before ratio stopping |
+| `LEGACY_FAILED_RETRY_TIMEOUT_SECONDS` | `300` | Maximum sequential retry-batch duration |
 | `SEARCH_SCORE_THRESHOLD` | `0.30` | Minimum score for dense-only search results (0.0-1.0). Only used as fallback when hybrid search fails at query time |
 | `SEARCH_SCORE_THRESHOLD_HYBRID` | `0.0` | Minimum score for hybrid (RRF) search results. RRF score range depends on Qdrant's k constant (default k=1 gives ~0.1-1.0, similar to cosine; k=60 gives ~0.01-0.03). Default 0.0 disables threshold filtering |
 | `DEDUP_SIMILARITY_THRESHOLD` | `0.4` | Minimum similarity for deduplication matching during memory ingestion |

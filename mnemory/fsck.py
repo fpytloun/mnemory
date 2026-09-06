@@ -18,9 +18,11 @@ import logging
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from qdrant_client.models import PointStruct
@@ -39,6 +41,11 @@ from mnemory.prompts import (
     build_fsck_duplicate_prompt,
     build_fsck_metadata_normalization_prompt,
     build_fsck_security_reeval_prompt,
+)
+from mnemory.revisions import (
+    FSCK_AUDIT_MAX_TARGETS,
+    FSCK_AUDIT_MODE,
+    canonical_fingerprint,
 )
 from mnemory.sanitize import detect_injection_patterns
 from mnemory.storage.vector import VectorStore
@@ -131,6 +138,7 @@ class FsckCheck:
 
     check_id: str
     user_id: str
+    owner_id: str | None = None
     agent_id: str | None = None
     status: str = "running"  # running, applying, completed, failed
     progress: FsckProgress = field(default_factory=FsckProgress)
@@ -146,6 +154,13 @@ class FsckCheck:
     llm_calls: int = 0
     # Track which issues have been applied to prevent double-apply.
     applied_issue_ids: set[str] = field(default_factory=set)
+    mode: str = "scan"
+    basis_operation_id: str | None = None
+    basis_operation_fingerprint: str | None = None
+    audit_issue_type: str | None = None
+    target_revisions: list[dict[str, Any]] = field(default_factory=list)
+    target_state: str | None = None
+    target_snapshot_fingerprint: str | None = None
 
     @property
     def is_expired(self) -> bool:
@@ -179,12 +194,14 @@ class FsckStore:
     def create(
         self,
         user_id: str,
+        owner_id: str | None = None,
         agent_id: str | None = None,
     ) -> FsckCheck:
         """Create a new check and return it."""
         check = FsckCheck(
             check_id=str(uuid.uuid4()),
             user_id=user_id,
+            owner_id=owner_id or user_id,
             agent_id=agent_id,
             ttl_seconds=self._default_ttl,
         )
@@ -202,6 +219,11 @@ class FsckStore:
                 del self._checks[check_id]
                 return None
             return check
+
+    def put(self, check: FsckCheck) -> None:
+        """Store a reconstructed durable check."""
+        with self._lock:
+            self._checks[check.check_id] = check
 
     def sweep(self) -> int:
         """Remove expired checks. Returns count removed."""
@@ -317,6 +339,7 @@ class FsckService:
     def start_check(
         self,
         user_id: str,
+        owner_id: str | None = None,
         agent_id: str | None = None,
     ) -> FsckCheck:
         """Create a new check and return it (status=running).
@@ -325,8 +348,317 @@ class FsckService:
         task after this returns, passing any filter parameters (categories,
         memory_type) directly to run_check().
         """
-        check = self._store.create(user_id, agent_id)
+        check = self._store.create(user_id, owner_id, agent_id)
         return check
+
+    @staticmethod
+    def _normalized_action_plan(plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Return the behavior-bearing action fields in stable order."""
+        normalized = [
+            {
+                "action": item.get("action"),
+                "memory_id": item.get("memory_id"),
+                "new_content": item.get("new_content"),
+                "new_metadata": item.get("new_metadata"),
+            }
+            for item in plan
+        ]
+        normalized.sort(
+            key=lambda item: (
+                str(item.get("memory_id") or ""),
+                str(item.get("action") or ""),
+                canonical_fingerprint(item),
+            )
+        )
+        return normalized
+
+    @classmethod
+    def _basis_operation_fingerprint(cls, operation: dict[str, Any]) -> str:
+        """Bind an audit to one immutable fsck operation definition."""
+        return canonical_fingerprint(
+            {
+                "operation_id": operation.get("operation_id"),
+                "fsck_check_id": operation.get("fsck_check_id"),
+                "fsck_issue_id": operation.get("fsck_issue_id"),
+                "issue_type": (operation.get("issue") or {}).get("type"),
+                "plan": cls._normalized_action_plan(operation.get("plan") or []),
+            }
+        )
+
+    @staticmethod
+    def _operation_target_revisions(
+        operation: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        """Return exact revision and agent bindings from an fsck operation."""
+        issue = operation.get("issue") or {}
+        affected = {
+            str(item.get("id")): item
+            for item in issue.get("affected_memories") or []
+            if isinstance(item, dict) and item.get("id")
+        }
+        targets: dict[str, dict[str, Any]] = {}
+        expected_revisions = {
+            str(item["memory_id"]): item.get("expected_revision")
+            for item in operation.get("plan") or []
+            if isinstance(item, dict) and item.get("memory_id")
+        }
+        for memory_id, source in affected.items():
+            metadata = source.get("metadata") or {}
+            revision = expected_revisions.get(memory_id) or metadata.get("revision")
+            if revision is None:
+                raise ValueError("Fsck operation target revision is unavailable")
+            targets[memory_id] = {
+                "memory_id": memory_id,
+                "revision": int(revision),
+                "agent_id": source.get("agent_id"),
+            }
+        for item in operation.get("plan") or []:
+            if not isinstance(item, dict) or not item.get("memory_id"):
+                continue
+            memory_id = str(item["memory_id"])
+            source = affected.get(memory_id) or {}
+            metadata = source.get("metadata") or {}
+            revision = item.get("expected_revision", metadata.get("revision"))
+            if revision is None:
+                raise ValueError("Fsck operation target revision is unavailable")
+            target = {
+                "memory_id": memory_id,
+                "revision": int(revision),
+                "agent_id": source.get("agent_id"),
+            }
+            previous = targets.get(memory_id)
+            if previous is not None and previous != target:
+                raise ValueError("Fsck operation target binding is inconsistent")
+            targets[memory_id] = target
+        result = sorted(targets.values(), key=lambda item: item["memory_id"])
+        if not result or len(result) > FSCK_AUDIT_MAX_TARGETS:
+            raise ValueError("Fsck operation target set is not auditable")
+        return result
+
+    def _get_authorized_fsck_operation(
+        self,
+        operation_id: str,
+        *,
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None,
+    ) -> dict[str, Any]:
+        """Return one authorized fsck operation without leaking its scope."""
+        if self._memory_service is None:
+            raise RuntimeError("Fsck operation journal is not available")
+        operation = self._memory_service.revisions.operations.get_by_id(operation_id)
+        if operation is None or operation.get("operation_kind") != "fsck":
+            raise ValueError("Fsck operation not found")
+        if operation.get("user_id") != user_id or operation.get("owner_id") != owner_id:
+            raise ValueError("Fsck operation not found")
+        if not self._agent_scope_allows(operation.get("agent_id"), session_agent_id):
+            raise ValueError("Fsck operation not found")
+        return operation
+
+    def start_exact_audit(
+        self,
+        *,
+        basis_operation_id: str,
+        targets: list[dict[str, Any]],
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None,
+    ) -> FsckCheck:
+        """Create a bounded audit bound to one operation and exact revisions."""
+        operation = self._get_authorized_fsck_operation(
+            basis_operation_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
+        expected = self._operation_target_revisions(operation)
+        requested = sorted(
+            (
+                {"memory_id": str(item["memory_id"]), "revision": int(item["revision"])}
+                for item in targets
+            ),
+            key=lambda item: item["memory_id"],
+        )
+        expected_request = [
+            {"memory_id": item["memory_id"], "revision": item["revision"]}
+            for item in expected
+        ]
+        if requested != expected_request:
+            raise ValueError("Fsck operation or target set not found")
+        check = self.start_check(
+            user_id=user_id,
+            owner_id=owner_id,
+            agent_id=operation.get("agent_id"),
+        )
+        check.mode = FSCK_AUDIT_MODE
+        check.basis_operation_id = basis_operation_id
+        check.basis_operation_fingerprint = self._basis_operation_fingerprint(operation)
+        check.audit_issue_type = (operation.get("issue") or {}).get("type")
+        check.target_revisions = expected
+        return check
+
+    def _load_exact_audit_targets(
+        self,
+        targets: list[dict[str, Any]],
+        *,
+        user_id: str,
+        owner_id: str,
+    ) -> tuple[str, list[dict[str, Any]], str]:
+        """Strictly load exact revisions and return state plus snapshot hash."""
+        ids = [item["memory_id"] for item in targets]
+        memories = self._vector.get_by_ids_strict(ids)
+        by_id = {str(memory["id"]): memory for memory in memories}
+        state = "complete"
+        snapshots: list[dict[str, Any]] = []
+        ordered_memories: list[dict[str, Any]] = []
+        for target in targets:
+            memory_id = target["memory_id"]
+            memory = by_id.get(memory_id)
+            if memory is None:
+                state = "absent"
+                snapshots.append({"memory_id": memory_id, "state": "absent"})
+                continue
+            metadata = memory.get("metadata") or {}
+            stale = (
+                memory.get("user_id") != user_id
+                or (memory.get("owner_id") or memory.get("user_id")) != owner_id
+                or memory.get("agent_id") != target.get("agent_id")
+                or int(metadata.get("revision", 1)) != int(target["revision"])
+                or metadata.get("revision_state", "active") != "active"
+                or bool(metadata.get("superseded_by"))
+            )
+            if stale and state != "absent":
+                state = "stale"
+            snapshots.append(
+                {
+                    "memory_id": memory_id,
+                    "revision": metadata.get("revision", 1),
+                    "lineage_id": metadata.get("lineage_id", memory_id),
+                    "revision_state": metadata.get("revision_state", "active"),
+                    "superseded_by": metadata.get("superseded_by"),
+                    "user_id": memory.get("user_id"),
+                    "owner_id": memory.get("owner_id") or memory.get("user_id"),
+                    "agent_id": memory.get("agent_id"),
+                    "content_hash": memory.get("hash"),
+                }
+            )
+            ordered_memories.append(memory)
+        return state, ordered_memories, canonical_fingerprint(snapshots)
+
+    def run_exact_audit(self, check_id: str) -> None:
+        """Analyze only bound revisions and persist a content-free audit."""
+        check = self._store.get(check_id)
+        if check is None or check.mode != FSCK_AUDIT_MODE:
+            return
+        try:
+            state, memories, before_fingerprint = self._load_exact_audit_targets(
+                check.target_revisions,
+                user_id=check.user_id,
+                owner_id=check.owner_id or check.user_id,
+            )
+            issues: list[FsckIssue] = []
+            if state == "complete":
+                if check.audit_issue_type in {"duplicate", "contradiction"}:
+                    issues = self._evaluate_duplicate_cluster(memories)
+                elif check.audit_issue_type == "security":
+                    issues = self._phase_security_reeval(
+                        self._phase_security_scan_regex(memories)
+                    )
+                else:
+                    issues = self._phase_quality_check(
+                        memories,
+                        check,
+                        available_categories=sorted(
+                            set(PREDEFINED_CATEGORIES)
+                            | {
+                                str(category)
+                                for memory in memories
+                                for category in (
+                                    (memory.get("metadata") or {}).get("categories", [])
+                                )
+                            }
+                        ),
+                    )
+                after_state, _, after_fingerprint = self._load_exact_audit_targets(
+                    check.target_revisions,
+                    user_id=check.user_id,
+                    owner_id=check.owner_id or check.user_id,
+                )
+                if after_state != "complete" or after_fingerprint != before_fingerprint:
+                    state = "stale"
+                    issues = []
+            else:
+                after_fingerprint = before_fingerprint
+            issues.sort(
+                key=lambda issue: (
+                    issue.type,
+                    sorted(action.memory_id or "" for action in issue.actions),
+                    issue.issue_id,
+                )
+            )
+            check.issues = issues
+            check.target_state = state
+            check.target_snapshot_fingerprint = after_fingerprint
+            check.summary = self._build_summary(issues)
+            check.progress = FsckProgress(
+                phase="done",
+                total_memories=len(check.target_revisions),
+                processed=len(memories),
+                percent=100,
+                issues_found=len(issues),
+            )
+            check.status = "completed"
+            completed_at = datetime.now(timezone.utc).isoformat()
+            signatures = []
+            for issue in issues:
+                plan = [
+                    {
+                        "action": action.action,
+                        "memory_id": action.memory_id,
+                        "new_content": action.new_content,
+                        "new_metadata": action.new_metadata,
+                    }
+                    for action in issue.actions
+                ]
+                signatures.append(
+                    {
+                        "issue_id": issue.issue_id,
+                        "type": issue.type,
+                        "action_target_ids": sorted(
+                            action.memory_id
+                            for action in issue.actions
+                            if action.memory_id
+                        ),
+                        "action_count": len(plan),
+                        "plan_fingerprint": canonical_fingerprint(
+                            self._normalized_action_plan(plan)
+                        ),
+                    }
+                )
+            self._memory_service.revisions.operations.create_fsck_audit(
+                {
+                    "audit_check_id": check.check_id,
+                    "user_id": check.user_id,
+                    "owner_id": check.owner_id or check.user_id,
+                    "agent_id": check.agent_id,
+                    "basis_operation_id": check.basis_operation_id,
+                    "basis_operation_fingerprint": (check.basis_operation_fingerprint),
+                    "target_revisions": check.target_revisions,
+                    "target_revision_ids": [
+                        item["memory_id"] for item in check.target_revisions
+                    ],
+                    "target_state": state,
+                    "target_snapshot_fingerprint": after_fingerprint,
+                    "issue_signatures": signatures,
+                    "summary": vars(check.summary),
+                    "created_at_utc": check.created_at_utc,
+                    "completed_at_utc": completed_at,
+                }
+            )
+        except Exception as exc:
+            logger.exception("Exact fsck audit %s failed", check_id)
+            check.status = "failed"
+            check.error = type(exc).__name__
 
     def run_check(
         self,
@@ -365,6 +697,7 @@ class FsckService:
             # as both agent-scoped and shared).
             memories = self._vector.scroll_with_vectors(
                 user_id=check.user_id,
+                owner_id=check.owner_id or check.user_id,
                 agent_id=check.agent_id,
                 filters=filters,
                 exclude_layers=None if include_raw else ["raw"],
@@ -373,6 +706,7 @@ class FsckService:
             if check.agent_id:
                 shared_memories = self._vector.scroll_with_vectors(
                     user_id=check.user_id,
+                    owner_id=check.owner_id or check.user_id,
                     agent_id=None,
                     shared_only=True,
                     filters=filters,
@@ -398,23 +732,6 @@ class FsckService:
                     )
                 ]
 
-            total = len(memories)
-
-            # Apply memory count cap
-            max_memories = self._config.memory.fsck_max_memories
-            if max_memories > 0 and total > max_memories:
-                import random
-
-                logger.info(
-                    "Fsck check %s: capping %d memories to %d (random sample)",
-                    check_id,
-                    total,
-                    max_memories,
-                )
-                memories = random.sample(memories, max_memories)
-                total = len(memories)
-                check.progress.truncated = True
-
             # Incremental mode: only check memories changed since last maintenance.
             # A memory is "changed" if it has no checked_at or its updated_at_utc
             # is more recent than checked_at. checked_at is stamped all-or-nothing
@@ -437,7 +754,22 @@ class FsckService:
                     len(full_corpus),
                 )
             else:
-                full_corpus = memories
+                full_corpus = list(memories)
+
+            # Cap the working set after incremental selection. Keep the full
+            # eligible corpus for nearest-neighbor resolution.
+            max_memories = self._config.memory.fsck_max_memories
+            if max_memories > 0 and len(memories) > max_memories:
+                import random
+
+                logger.info(
+                    "Fsck check %s: capping %d candidates to %d (random sample)",
+                    check_id,
+                    len(memories),
+                    max_memories,
+                )
+                memories = random.sample(memories, max_memories)
+                check.progress.truncated = True
 
             total = len(memories)
             check.progress.total_memories = total
@@ -460,6 +792,7 @@ class FsckService:
                 if full_corpus is not memories
                 else mem_by_id
             )
+            check.issues.extend(self._phase_validation_projection(memories))
 
             # Phase 0a: Security scan (regex, no LLM) — 0-3%
             check.progress.phase = "security_scan"
@@ -593,14 +926,139 @@ class FsckService:
             check.status = "failed"
             check.error = str(e)
 
-    def get_check(self, check_id: str) -> FsckCheck | None:
+    def get_check(
+        self,
+        check_id: str,
+        *,
+        user_id: str | None = None,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
+    ) -> FsckCheck | None:
         """Get a check by ID."""
-        return self._store.get(check_id)
+        check = self._store.get(check_id)
+        if check is not None:
+            if user_id is not None and check.user_id != user_id:
+                return None
+            if owner_id is not None and (check.owner_id or check.user_id) != owner_id:
+                return None
+            if not self._agent_scope_allows(check.agent_id, session_agent_id):
+                return None
+            return check
+        if self._memory_service is None:
+            return None
+        records = self._memory_service.revisions.operations.list_fsck(
+            check_id,
+            user_id=user_id,
+        )
+        if not records:
+            audit = self._memory_service.revisions.operations.get_fsck_audit(check_id)
+            if audit is None:
+                return None
+            if user_id is not None and audit.get("user_id") != user_id:
+                return None
+            if (
+                owner_id is not None
+                and audit.get("owner_id") != owner_id
+                or not self._agent_scope_allows(audit.get("agent_id"), session_agent_id)
+            ):
+                return None
+            summary_payload = audit.get("summary") or {}
+            check = FsckCheck(
+                check_id=check_id,
+                user_id=audit["user_id"],
+                owner_id=audit["owner_id"],
+                agent_id=audit.get("agent_id"),
+                status="completed",
+                summary=FsckSummary(**summary_payload),
+                mode=FSCK_AUDIT_MODE,
+                basis_operation_id=audit.get("basis_operation_id"),
+                basis_operation_fingerprint=audit.get("basis_operation_fingerprint"),
+                target_revisions=list(audit.get("target_revisions") or []),
+                target_state=audit.get("target_state"),
+                target_snapshot_fingerprint=audit.get("target_snapshot_fingerprint"),
+            )
+            check.progress = FsckProgress(
+                phase="done",
+                total_memories=len(check.target_revisions),
+                processed=len(check.target_revisions),
+                percent=100,
+                issues_found=int(summary_payload.get("total", 0)),
+            )
+            self._store.put(check)
+            return check
+        if owner_id is not None:
+            records = [
+                record
+                for record in records
+                if record.get("owner_id") == owner_id
+                and self._agent_scope_allows(
+                    record.get("agent_id"),
+                    session_agent_id,
+                )
+            ]
+        if not records:
+            return None
+        issues = []
+        applied_ids = set()
+        for record in records:
+            issue_payload = record.get("issue")
+            if not isinstance(issue_payload, dict):
+                continue
+            issues.append(
+                FsckIssue(
+                    issue_id=issue_payload["issue_id"],
+                    type=issue_payload["type"],
+                    severity=issue_payload["severity"],
+                    reasoning=issue_payload["reasoning"],
+                    affected_memories=[
+                        FsckAffectedMemory(**memory)
+                        for memory in issue_payload.get("affected_memories", [])
+                    ],
+                    actions=[
+                        FsckAction(**action)
+                        for action in issue_payload.get("actions", [])
+                    ],
+                    confidence=issue_payload.get("confidence"),
+                )
+            )
+            if record.get("status") == "committed":
+                applied_ids.add(issue_payload["issue_id"])
+        if not issues:
+            return None
+        check = FsckCheck(
+            check_id=check_id,
+            user_id=records[0]["user_id"],
+            owner_id=records[0].get("owner_id") or records[0]["user_id"],
+            agent_id=records[0].get("agent_id"),
+            status="completed",
+            issues=issues,
+            applied_issue_ids=applied_ids,
+        )
+        self._store.put(check)
+        return check
+
+    @staticmethod
+    def _agent_scope_allows(
+        check_agent_id: str | None,
+        session_agent_id: str | None,
+    ) -> bool:
+        """Return whether a session agent can access a scoped fsck check."""
+        if check_agent_id is None:
+            return True
+        if session_agent_id is None:
+            return False
+        return check_agent_id == session_agent_id or check_agent_id.startswith(
+            session_agent_id + ":"
+        )
 
     def apply_check(
         self,
         check_id: str,
         issue_ids: list[str] | None = None,
+        *,
+        user_id: str | None = None,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
     ) -> dict[str, Any]:
         """Apply fixes from a completed check.
 
@@ -615,11 +1073,21 @@ class FsckService:
         Returns:
             Dict with applied/skipped/failed counts and details.
         """
-        check = self._store.get(check_id)
+        check = self.get_check(
+            check_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
         if check is None:
             return {
                 "error": True,
                 "message": "Check not found or expired. Please re-run the check.",
+            }
+        if check.mode == FSCK_AUDIT_MODE:
+            return {
+                "error": True,
+                "message": "Audit-only fsck checks cannot apply actions",
             }
         if check.status not in ("completed", "applying"):
             return {
@@ -653,26 +1121,446 @@ class FsckService:
                 )
                 continue
 
+            operation_token = None
+            operation_claimed = False
+            checkpoints: list[dict[str, Any]] = []
+            plan: list[dict[str, Any]] = []
             try:
+                if self._memory_service is not None:
+                    from mnemory.revisions import canonical_fingerprint
+
+                    sources = [
+                        self._vector.get_by_id(memory.id)
+                        for memory in issue.affected_memories
+                    ]
+                    check_sources = {
+                        memory.id: memory.metadata or {}
+                        for memory in issue.affected_memories
+                    }
+                    for index, action in enumerate(issue.actions):
+                        source = (
+                            self._vector.get_by_id(action.memory_id)
+                            if action.memory_id
+                            else None
+                        )
+                        metadata = check_sources.get(action.memory_id or "", {})
+                        result_revision_id = (
+                            str(
+                                uuid.uuid5(
+                                    uuid.NAMESPACE_URL,
+                                    (
+                                        f"mnemory:fsck:{check.check_id}:"
+                                        f"{issue.issue_id}:{action.new_content}"
+                                    ),
+                                )
+                            )
+                            if action.action == "add"
+                            else None
+                        )
+                        plan.append(
+                            {
+                                "action": action.action,
+                                "memory_id": action.memory_id,
+                                "new_content": action.new_content,
+                                "new_metadata": action.new_metadata,
+                                "expected_revision": int(metadata.get("revision", 1))
+                                if source
+                                else None,
+                                "expected_revision_id": (
+                                    action.memory_id if source else None
+                                ),
+                                "result_revision_id": result_revision_id,
+                                "action_id": canonical_fingerprint(
+                                    [
+                                        check.check_id,
+                                        issue.issue_id,
+                                        index,
+                                        action.action,
+                                        action.memory_id,
+                                        action.new_content,
+                                        action.new_metadata,
+                                    ]
+                                ),
+                            }
+                        )
+                    operation_token = canonical_fingerprint(
+                        ["fsck", check.check_id, issue.issue_id, plan]
+                    )
+                    operations = self._memory_service.revisions.operations
+                    existing_operation = operations.get(operation_token)
+                    if existing_operation and existing_operation.get("status") in {
+                        "committed",
+                        "skipped",
+                        "superseded",
+                    }:
+                        skipped += 1
+                        details.append(
+                            {
+                                "issue_id": issue.issue_id,
+                                "status": "skipped",
+                                "actions_executed": 0,
+                                "actions_skipped": len(plan),
+                            }
+                        )
+                        continue
+                    if check.owner_id is None:
+                        raise RuntimeError("Fsck check owner scope is missing")
+                    audit_owner_id = check.owner_id
+                    affected_lineage_ids = list(
+                        dict.fromkeys(
+                            (
+                                (source_memory.get("metadata") or {}).get(
+                                    "lineage_id", memory.id
+                                )
+                                if source_memory
+                                else memory.id
+                            )
+                            for memory, source_memory in zip(
+                                issue.affected_memories, sources, strict=True
+                            )
+                        )
+                    )
+                    checkpoints = list(
+                        (existing_operation or {}).get("action_checkpoints") or []
+                    ) or [
+                        {
+                            "action_id": item["action_id"],
+                            "action_index": index,
+                            "action_kind": item["action"],
+                            "expected_revision_id": item["expected_revision_id"],
+                            "expected_revision": item["expected_revision"],
+                            "status": "pending",
+                        }
+                        for index, item in enumerate(plan)
+                    ]
+                    if existing_operation is None:
+                        operations.write(
+                            operation_token,
+                            {
+                                "status": "planned",
+                                "operation_kind": "fsck",
+                                "actor_kind": "fsck",
+                                "user_id": check.user_id,
+                                "owner_id": audit_owner_id,
+                                "agent_id": check.agent_id,
+                                "lineage_id": (
+                                    (issue.affected_memories[0].metadata or {}).get(
+                                        "lineage_id", issue.affected_memories[0].id
+                                    )
+                                    if issue.affected_memories
+                                    else f"fsck:{check.check_id}"
+                                ),
+                                "fsck_check_id": check.check_id,
+                                "fsck_issue_id": issue.issue_id,
+                                "issue": {
+                                    "issue_id": issue.issue_id,
+                                    "type": issue.type,
+                                    "severity": issue.severity,
+                                    "reasoning": issue.reasoning,
+                                    "confidence": issue.confidence,
+                                    "affected_memories": [
+                                        {
+                                            "id": memory.id,
+                                            "content": "",
+                                            "metadata": memory.metadata,
+                                            "agent_id": memory.agent_id,
+                                        }
+                                        for memory in issue.affected_memories
+                                    ],
+                                    "actions": [
+                                        {
+                                            "action": action.action,
+                                            "memory_id": action.memory_id,
+                                            "new_content": action.new_content,
+                                            "new_metadata": action.new_metadata,
+                                        }
+                                        for action in issue.actions
+                                    ],
+                                },
+                                "issue_fingerprint": canonical_fingerprint(
+                                    [
+                                        issue.type,
+                                        sorted(affected_lineage_ids),
+                                        plan,
+                                    ]
+                                ),
+                                "plan_hash": canonical_fingerprint(plan),
+                                "affected_lineage_ids": affected_lineage_ids,
+                                "plan": plan,
+                                "action_checkpoints": checkpoints,
+                            },
+                        )
+                    claimant = str(uuid.uuid4())
+                    lease_seconds = (
+                        self._config.memory.fsck_recovery_lease_seconds
+                        if isinstance(
+                            getattr(
+                                self._config.memory,
+                                "fsck_recovery_lease_seconds",
+                                None,
+                            ),
+                            int,
+                        )
+                        else 300
+                    )
+                    max_attempts = getattr(
+                        self._config.memory,
+                        "fsck_recovery_max_attempts",
+                        3,
+                    )
+                    if not isinstance(max_attempts, int):
+                        max_attempts = 3
+                    if (
+                        int((existing_operation or {}).get("recovery_attempt_count", 0))
+                        >= max_attempts
+                    ):
+                        exhausted = operations.terminalize_unclaimed(
+                            operation_token,
+                            status="failed",
+                            payload={
+                                "error_class": "RecoveryAttemptsExhausted",
+                                "error_at": datetime.now(timezone.utc).isoformat(),
+                                "terminal_reason": "recovery_attempts_exhausted",
+                            },
+                        )
+                        if not exhausted:
+                            skipped += 1
+                            details.append(
+                                {
+                                    "issue_id": issue.issue_id,
+                                    "status": "skipped",
+                                    "actions_executed": 0,
+                                    "actions_skipped": len(plan),
+                                    "error": "Operation is already claimed",
+                                }
+                            )
+                            continue
+                        failed += 1
+                        details.append(
+                            {
+                                "issue_id": issue.issue_id,
+                                "status": "failed",
+                                "actions_executed": 0,
+                                "actions_skipped": 0,
+                                "error": "Recovery attempts exhausted",
+                            }
+                        )
+                        continue
+                    if not operations.claim(
+                        operation_token,
+                        claimant=claimant,
+                        lease_seconds=lease_seconds,
+                        allowed_statuses=("planned", "failed", "applying"),
+                    ):
+                        skipped += 1
+                        details.append(
+                            {
+                                "issue_id": issue.issue_id,
+                                "status": "skipped",
+                                "actions_executed": 0,
+                                "actions_skipped": len(plan),
+                            }
+                        )
+                        continue
+                    operation_claimed = True
+                    checkpoints = self._resolve_action_checkpoints(
+                        plan,
+                        checkpoints,
+                        complete=False,
+                        check_id=check.check_id,
+                        issue_id=issue.issue_id,
+                    )
+                    if not operations.write_claimed(
+                        operation_token,
+                        claimant,
+                        {"action_checkpoints": checkpoints},
+                    ):
+                        raise RuntimeError("Fsck operation lease was lost")
+                    pending_indexes = {
+                        index
+                        for index, checkpoint in enumerate(checkpoints)
+                        if checkpoint.get("status") not in {"committed", "skipped"}
+                    }
+                    stale = False
+                    for index, item in enumerate(plan):
+                        if index not in pending_indexes:
+                            continue
+                        target = item.get("memory_id")
+                        if target is None or item.get("expected_revision") is None:
+                            continue
+                        current = self._vector.get_by_id_strict(target)
+                        if not isinstance(current, dict):
+                            current = self._vector.get_by_id(target)
+                        metadata = (current or {}).get("metadata") or {}
+                        if (
+                            current is None
+                            or current.get("id") != item.get("expected_revision_id")
+                            or metadata.get("revision_state", "active") != "active"
+                            or int(metadata.get("revision", 1))
+                            != int(item["expected_revision"])
+                        ):
+                            stale = True
+                            break
+                    if stale:
+                        if not operations.write_claimed(
+                            operation_token,
+                            claimant,
+                            {
+                                "status": "superseded",
+                                "terminal_reason": "target_revision_changed",
+                                "terminal_at": datetime.now(timezone.utc).isoformat(),
+                            },
+                        ):
+                            raise RuntimeError("Fsck operation lease was lost")
+                        skipped += 1
+                        details.append(
+                            {
+                                "issue_id": issue.issue_id,
+                                "status": "skipped",
+                                "actions_executed": 0,
+                                "actions_skipped": len(plan),
+                            }
+                        )
+                        continue
+
+                    before_action = partial(
+                        self._start_action_checkpoint,
+                        operations,
+                        operation_token,
+                        claimant,
+                        checkpoints,
+                        lease_seconds,
+                    )
+                    on_action = partial(
+                        self._finish_action_checkpoint,
+                        operations,
+                        operation_token,
+                        claimant,
+                        checkpoints,
+                    )
+
                 actions_executed, actions_skipped = self._apply_issue(
-                    issue, check.user_id
+                    issue,
+                    check.user_id,
+                    check_id=check.check_id,
+                    expected_revisions={
+                        item["memory_id"]: item["expected_revision"]
+                        for item in plan
+                        if item.get("memory_id")
+                        and item.get("expected_revision") is not None
+                    },
+                    action_indexes=(
+                        pending_indexes if operation_token is not None else None
+                    ),
+                    before_action=before_action
+                    if operation_token is not None
+                    else None,
+                    on_action=on_action if operation_token is not None else None,
                 )
+                if operation_token and self._memory_service is not None:
+                    checkpoints = self._resolve_action_checkpoints(
+                        plan,
+                        checkpoints,
+                        complete=True,
+                        check_id=check.check_id,
+                        issue_id=issue.issue_id,
+                    )
+                    committed_count = sum(
+                        checkpoint.get("status") == "committed"
+                        for checkpoint in checkpoints
+                    )
+                    skipped_count = sum(
+                        checkpoint.get("status") == "skipped"
+                        for checkpoint in checkpoints
+                    )
+                    pending_count = len(checkpoints) - committed_count - skipped_count
+                    if pending_count:
+                        raise RuntimeError("Fsck action journal is incomplete")
+                    outcome = "committed" if committed_count else "skipped"
+                    if not self._memory_service.revisions.operations.write_claimed(
+                        operation_token,
+                        claimant,
+                        {
+                            "status": outcome,
+                            "actions_executed": committed_count,
+                            "actions_skipped": skipped_count,
+                            "action_checkpoints": checkpoints,
+                            "terminal_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                    ):
+                        raise RuntimeError("Fsck operation lease was lost")
+                    actions_executed = committed_count
+                    actions_skipped = skipped_count
+                    from mnemory.metrics import get_collector
+
+                    collector = get_collector()
+                    if collector:
+                        collector.record_fsck_operation(outcome)
+                        if existing_operation is not None:
+                            collector.record_fsck_recovery(outcome)
                 # Only mark as applied (and prevent retry) when at least one
                 # action actually executed. If all actions were skipped (e.g.,
                 # memory not found), leave the issue available for future apply
                 # attempts so transient misses don't permanently block fixes.
                 if actions_executed > 0:
                     check.applied_issue_ids.add(issue.issue_id)
-                applied += 1
+                    applied += 1
+                    status = "applied"
+                else:
+                    skipped += 1
+                    status = "skipped"
                 details.append(
                     {
                         "issue_id": issue.issue_id,
-                        "status": "applied",
+                        "status": status,
                         "actions_executed": actions_executed,
                         "actions_skipped": actions_skipped,
                     }
                 )
-            except Exception as e:
+            except BaseException as e:
+                if operation_token and self._memory_service is not None:
+                    checkpoints = self._resolve_action_checkpoints(
+                        plan,
+                        checkpoints,
+                        complete=False,
+                        check_id=check.check_id,
+                        issue_id=issue.issue_id,
+                    )
+                    if operation_claimed:
+                        terminalized = (
+                            self._memory_service.revisions.operations.write_claimed(
+                                operation_token,
+                                claimant,
+                                {
+                                    "status": "failed",
+                                    "error_class": type(e).__name__,
+                                    "error_at": datetime.now(timezone.utc).isoformat(),
+                                    "terminal_at": datetime.now(
+                                        timezone.utc
+                                    ).isoformat(),
+                                    "terminal_reason": "apply_exception",
+                                    "action_checkpoints": checkpoints,
+                                },
+                            )
+                        )
+                    else:
+                        terminalized = self._memory_service.revisions.operations.terminalize_unclaimed(
+                            operation_token,
+                            status="failed",
+                            payload={
+                                "error_class": type(e).__name__,
+                                "error_at": datetime.now(timezone.utc).isoformat(),
+                                "terminal_reason": "apply_exception",
+                                "action_checkpoints": checkpoints,
+                            },
+                        )
+                    from mnemory.metrics import get_collector
+
+                    collector = get_collector()
+                    if collector and terminalized:
+                        collector.record_fsck_operation("failed")
+                        if existing_operation is not None:
+                            collector.record_fsck_recovery("failed")
                 logger.warning(
                     "Failed to apply fsck issue %s: %s",
                     issue.issue_id,
@@ -688,6 +1576,8 @@ class FsckService:
                         "error": str(e),
                     }
                 )
+                if not isinstance(e, Exception):
+                    raise
 
         # Invalidate caches so mutations are reflected immediately.
         if self._memory_service is not None and (applied > 0 or failed > 0):
@@ -708,7 +1598,306 @@ class FsckService:
             "details": details,
         }
 
-    # ── Phase 0: Security scan ───────────────────────────────────────
+    def _resolve_action_checkpoints(
+        self,
+        plan: list[dict[str, Any]],
+        checkpoints: list[dict[str, Any]],
+        *,
+        complete: bool,
+        check_id: str,
+        issue_id: str,
+    ) -> list[dict[str, Any]]:
+        """Resolve checkpoints only from exact operation-owned side effects."""
+        del complete
+        now = datetime.now(timezone.utc).isoformat()
+        resolved = []
+        for item, checkpoint in zip(plan, checkpoints, strict=True):
+            status = checkpoint.get("status", "pending")
+            if status in {"committed", "skipped"}:
+                resolved.append(checkpoint)
+                continue
+            action = item.get("action")
+            target = (
+                item.get("result_revision_id")
+                if action == "add"
+                else (item.get("expected_revision_id") or item.get("memory_id"))
+            )
+            point = self._vector.get_by_id_strict(target) if target else None
+            if point is not None and not isinstance(point, dict):
+                point = self._vector.get_by_id(target)
+            metadata = (point or {}).get("metadata") or {}
+            subordinate_operation_id = checkpoint.get("subordinate_operation_id")
+            if subordinate_operation_id is None and action in {"update", "delete"}:
+                subordinate_operation_id = metadata.get("revision_operation_id")
+            applied = False
+            if action == "add":
+                applied = bool(
+                    point
+                    and point.get("id") == item.get("result_revision_id")
+                    and metadata.get("revision_state", "active") == "active"
+                )
+            elif action == "delete" and metadata.get("revision_operation_id") == (
+                f"fsck:{check_id}:{issue_id}"
+            ):
+                applied = metadata.get("revision_state") == "source"
+                subordinate_operation_id = f"fsck:{check_id}:{issue_id}"
+            elif subordinate_operation_id and self._memory_service is not None:
+                operation = (
+                    self._memory_service.revisions.operations.get_by_id(
+                        subordinate_operation_id
+                    )
+                    or {}
+                )
+                applied = bool(
+                    operation.get("status") == "committed"
+                    and operation.get("fsck_check_id") == check_id
+                    and operation.get("fsck_issue_id") == issue_id
+                    and operation.get("previous_revision_id")
+                    == item.get("expected_revision_id")
+                )
+            if applied:
+                status = "committed"
+            resolved.append(
+                {
+                    **checkpoint,
+                    "status": status,
+                    "subordinate_operation_id": subordinate_operation_id,
+                    **(
+                        {"completed_at": now}
+                        if status in {"committed", "skipped"}
+                        else {}
+                    ),
+                }
+            )
+        return resolved
+
+    @staticmethod
+    def _start_action_checkpoint(
+        operations: Any,
+        operation_token: str,
+        claimant: str,
+        checkpoints: list[dict[str, Any]],
+        lease_seconds: int,
+        action_index: int,
+    ) -> None:
+        """Fence one action with a lease-owned applying checkpoint."""
+        if not operations.renew_claim(
+            operation_token,
+            claimant,
+            lease_seconds=lease_seconds,
+        ):
+            raise RuntimeError("Fsck operation lease was lost")
+        checkpoints[action_index] = {
+            **checkpoints[action_index],
+            "status": "applying",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if not operations.write_claimed(
+            operation_token,
+            claimant,
+            {"action_checkpoints": checkpoints},
+        ):
+            raise RuntimeError("Fsck operation lease was lost")
+
+    @staticmethod
+    def _finish_action_checkpoint(
+        operations: Any,
+        operation_token: str,
+        claimant: str,
+        checkpoints: list[dict[str, Any]],
+        action_index: int,
+        status: str,
+        subordinate_operation_id: str | None,
+    ) -> None:
+        """Persist one action outcome while the caller owns the lease."""
+        checkpoints[action_index] = {
+            **checkpoints[action_index],
+            "status": status,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "subordinate_operation_id": subordinate_operation_id,
+        }
+        if not operations.write_claimed(
+            operation_token,
+            claimant,
+            {"action_checkpoints": checkpoints},
+        ):
+            raise RuntimeError("Fsck operation lease was lost")
+
+    def re_evaluate_operation(
+        self,
+        operation_id: str,
+        *,
+        fresh_check_id: str,
+        user_id: str,
+        owner_id: str,
+        session_agent_id: str | None,
+        terminalize: bool = False,
+    ) -> dict[str, Any]:
+        """Compare an old fsck operation with a separately generated check."""
+        operation = self._get_authorized_fsck_operation(
+            operation_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            session_agent_id=session_agent_id,
+        )
+        operations = self._memory_service.revisions.operations
+        audit = operations.get_fsck_audit(fresh_check_id)
+        expected_targets = self._operation_target_revisions(operation)
+        basis_fingerprint = self._basis_operation_fingerprint(operation)
+        if (
+            audit is None
+            or audit.get("status") != "committed"
+            or audit.get("user_id") != user_id
+            or audit.get("owner_id") != owner_id
+            or audit.get("agent_id") != operation.get("agent_id")
+            or audit.get("basis_operation_id") != operation_id
+            or audit.get("basis_operation_fingerprint") != basis_fingerprint
+            or audit.get("target_revisions") != expected_targets
+            or str(audit.get("created_at_utc") or "")
+            <= str(operation.get("created_at_utc") or "")
+        ):
+            raise ValueError("Fresh exact fsck audit is not available")
+
+        current_state, current_memories, current_fingerprint = (
+            self._load_exact_audit_targets(
+                expected_targets,
+                user_id=user_id,
+                owner_id=owner_id,
+            )
+        )
+        old_plan = operation.get("plan") or []
+        old_targets = sorted(
+            item.get("memory_id")
+            for item in old_plan
+            if isinstance(item, dict) and item.get("memory_id")
+        )
+        old_type = (operation.get("issue") or {}).get("type")
+        candidates = [
+            signature
+            for signature in audit.get("issue_signatures") or []
+            if signature.get("type") == old_type
+            and signature.get("action_target_ids") == old_targets
+        ]
+        audit_state = audit.get("target_state")
+        if audit_state == "absent" or current_state == "absent":
+            outcome = "absent"
+        elif (
+            audit_state != "complete"
+            or current_state != "complete"
+            or current_fingerprint != audit.get("target_snapshot_fingerprint")
+        ):
+            outcome = "stale"
+        else:
+            outcome = "absent"
+        fresh_issue_id = None
+        fresh_action_count = 0
+        if outcome == "absent" and audit_state == "complete" and candidates:
+            normalized_old_fingerprint = canonical_fingerprint(
+                self._normalized_action_plan(old_plan)
+            )
+            matching = next(
+                (
+                    candidate
+                    for candidate in candidates
+                    if candidate.get("plan_fingerprint") == normalized_old_fingerprint
+                ),
+                None,
+            )
+            fresh_issue = matching or candidates[0]
+            fresh_issue_id = fresh_issue.get("issue_id")
+            fresh_action_count = int(fresh_issue.get("action_count", 0))
+            outcome = "still_valid" if matching is not None else "changed"
+        if current_state == "complete":
+            stale_targets = 0
+        elif current_state == "absent":
+            stale_targets = max(len(expected_targets) - len(current_memories), 1)
+        else:
+            stale_targets = 1
+
+        if terminalize:
+            if operation.get("status") in {"committed", "skipped", "superseded"}:
+                raise ValueError("Fsck operation is already terminal")
+            terminalized = operations.terminalize_unclaimed(
+                operation["operation_token"],
+                status="superseded",
+                payload={
+                    "terminal_reason": f"re_evaluated_{outcome}",
+                    "fresh_check_id": fresh_check_id,
+                    "fresh_issue_id": fresh_issue_id,
+                },
+            )
+            if not terminalized:
+                raise RuntimeError("Fsck operation is currently leased")
+
+        return {
+            "operation_id": operation_id,
+            "outcome": outcome,
+            "terminalized": terminalize,
+            "old_action_count": len(old_plan),
+            "fresh_action_count": fresh_action_count,
+            "stale_target_count": stale_targets,
+            "fresh_check_id": fresh_check_id,
+            "fresh_issue_id": fresh_issue_id,
+        }
+
+    # ── Phase 0: deterministic projection and security checks ───────
+
+    def _phase_validation_projection(self, memories: list[dict]) -> list[FsckIssue]:
+        """Detect rebuildable validation projection mismatches."""
+        from mnemory.revisions import canonical_fingerprint
+
+        configured_roots = getattr(self._config.memory, "validation_max_score_roots", 3)
+        max_roots = max(configured_roots if isinstance(configured_roots, int) else 3, 1)
+        issues: list[FsckIssue] = []
+        for memory in memories:
+            metadata = memory.get("metadata") or {}
+            if not (
+                metadata.get("evidence_root_ids")
+                or metadata.get("validation_count")
+                or metadata.get("validation_state") == "confirmed"
+            ):
+                continue
+            can_carry_validation = (
+                metadata.get("validation_eligible")
+                or metadata.get("validation_state") == "confirmed"
+            )
+            roots = (
+                list(dict.fromkeys(metadata.get("evidence_root_ids") or []))
+                if can_carry_validation
+                else []
+            )
+            expected_count = min(max(len(roots) - 1, 0), max_roots)
+            expected = {
+                "evidence_root_ids": roots,
+                "validation_count": expected_count,
+                "validation_strength": expected_count / max_roots,
+                "validation_projection_hash": canonical_fingerprint(roots),
+                "validation_state": ("confirmed" if expected_count else "unverified"),
+            }
+            if all(metadata.get(key) == value for key, value in expected.items()):
+                continue
+            issues.append(
+                FsckIssue(
+                    issue_id=str(uuid.uuid4()),
+                    type="quality",
+                    severity="low",
+                    reasoning="Validation projection metadata is inconsistent",
+                    affected_memories=[
+                        FsckAffectedMemory(
+                            id=memory["id"],
+                            content=memory.get("memory", ""),
+                            metadata=metadata,
+                            agent_id=memory.get("agent_id"),
+                        )
+                    ],
+                    # Projection drift is report-only. A confirmation can
+                    # change roots between scan and apply, so an fsck proposal
+                    # must not write an older projection without a claim.
+                    actions=[],
+                    confidence=1.0,
+                )
+            )
+        return issues
 
     def _phase_security_scan_regex(
         self,
@@ -932,6 +2121,7 @@ class FsckService:
         # unchanged memories.
         corpus_by_id = full_corpus_by_id if full_corpus_by_id is not None else mem_by_id
         total = len(memories)
+        neighbor_limit = max(_DUPLICATE_NEIGHBORS, len(corpus_by_id))
 
         # ── Sub-phase 1a: Build similarity graph ────────────────────
         check.progress.phase = "duplicate_search"
@@ -948,7 +2138,7 @@ class FsckService:
                     vector,
                     user_id=check.user_id,
                     agent_id=check.agent_id,
-                    limit=_DUPLICATE_NEIGHBORS,
+                    limit=neighbor_limit,
                     exclude_ids=[mem["id"]],
                 )
                 if check.agent_id:
@@ -957,7 +2147,7 @@ class FsckService:
                         user_id=check.user_id,
                         agent_id=None,
                         shared_only=True,
-                        limit=_DUPLICATE_NEIGHBORS,
+                        limit=neighbor_limit,
                         exclude_ids=[mem["id"]],
                     )
                     # Merge, deduplicate by ID, keep highest score
@@ -1450,7 +2640,17 @@ class FsckService:
 
     # ── Apply logic ──────────────────────────────────────────────────
 
-    def _apply_issue(self, issue: FsckIssue, user_id: str) -> tuple[int, int]:
+    def _apply_issue(
+        self,
+        issue: FsckIssue,
+        user_id: str,
+        *,
+        check_id: str = "manual",
+        expected_revisions: dict[str, int] | None = None,
+        action_indexes: set[int] | None = None,
+        before_action: Callable[[int], None] | None = None,
+        on_action: Callable[[int, str, str | None], None] | None = None,
+    ) -> tuple[int, int]:
         """Apply all actions for a single issue.
 
         Returns:
@@ -1458,13 +2658,29 @@ class FsckService:
         """
         executed = 0
         skipped = 0
+        split_source_ids: list[str] = []
+        split_owner_id: str | None = None
+
+        def start_action(index: int) -> None:
+            if before_action is not None:
+                before_action(index)
+
+        def finish_action(
+            index: int,
+            status: str,
+            subordinate_operation_id: str | None = None,
+        ) -> None:
+            if on_action is not None:
+                on_action(index, status, subordinate_operation_id)
 
         # Guard: skip split actions on memories with artifacts.
         # Splitting would delete the original (destroying artifacts) and
         # create new memories without them. The prompt should prevent this,
         # but this is a hard safety net.
         if issue.type == "split":
-            for action in issue.actions:
+            for index, action in enumerate(issue.actions):
+                if action_indexes is not None and index not in action_indexes:
+                    continue
                 if action.action == "delete" and action.memory_id:
                     mem = self._vector.get_by_id(action.memory_id)
                     if mem and (mem.get("metadata") or {}).get("artifacts"):
@@ -1474,9 +2690,42 @@ class FsckService:
                             action.memory_id,
                             len(mem["metadata"]["artifacts"]),
                         )
+                        for skipped_index in action_indexes or range(
+                            len(issue.actions)
+                        ):
+                            finish_action(skipped_index, "skipped")
                         return 0, len(issue.actions)
 
-        for action in issue.actions:
+        if issue.type == "split" and self._memory_service is not None:
+            for index, action in enumerate(issue.actions):
+                if action_indexes is not None and index not in action_indexes:
+                    continue
+                if action.action != "delete" or not action.memory_id:
+                    continue
+                existing = self._vector.get_by_id(action.memory_id)
+                if existing is None or existing.get("user_id") != user_id:
+                    skipped += 1
+                    finish_action(index, "skipped")
+                    continue
+                split_source_ids.append(action.memory_id)
+                split_owner_id = existing.get("owner_id") or user_id
+                start_action(index)
+                subordinate_operation_id = f"fsck:{check_id}:{issue.issue_id}"
+                self._memory_service.revisions.mark_source(
+                    [action.memory_id],
+                    operation_id=subordinate_operation_id,
+                    user_id=user_id,
+                    owner_id=split_owner_id,
+                    session_agent_id=None,
+                    reason="split",
+                    expected_revisions=expected_revisions,
+                )
+                executed += 1
+                finish_action(index, "committed", subordinate_operation_id)
+
+        for index, action in enumerate(issue.actions):
+            if action_indexes is not None and index not in action_indexes:
+                continue
             if action.action == "delete" and action.memory_id:
                 # Verify ownership before deleting
                 existing = self._vector.get_by_id(action.memory_id)
@@ -1486,6 +2735,7 @@ class FsckService:
                         action.memory_id,
                     )
                     skipped += 1
+                    finish_action(index, "skipped")
                     continue
                 if existing.get("user_id") != user_id:
                     logger.warning(
@@ -1493,10 +2743,13 @@ class FsckService:
                         action.memory_id,
                     )
                     skipped += 1
+                    finish_action(index, "skipped")
                     continue
                 # Warn when deleting a memory with artifacts — the prompt
                 # should prevent this in most cases, but log for visibility.
                 existing_meta = existing.get("metadata") or {}
+                if issue.type == "split" and self._memory_service is not None:
+                    continue
                 if existing_meta.get("artifacts"):
                     logger.warning(
                         "Fsck apply: deleting memory %s which has %d artifact(s)",
@@ -1506,11 +2759,32 @@ class FsckService:
                 # Route through MemoryService to clean up artifacts and
                 # invalidate caches. Fall back to direct delete in tests.
                 if self._memory_service is not None:
-                    self._memory_service.delete_memory(
-                        memory_id=action.memory_id, user_id=user_id
+                    existing_meta = existing.get("metadata") or {}
+                    start_action(index)
+                    mutation = self._memory_service.delete_memory(
+                        memory_id=action.memory_id,
+                        user_id=user_id,
+                        owner_id=existing.get("owner_id") or user_id,
+                        expected_revision=(expected_revisions or {}).get(
+                            action.memory_id,
+                            int(existing_meta.get("revision", 1)),
+                        ),
+                        idempotency_key=(
+                            f"fsck:{check_id}:{issue.issue_id}:"
+                            f"delete:{action.memory_id}"
+                        ),
+                        actor_kind="fsck",
+                        reason=issue.type,
+                        audit={
+                            "fsck_check_id": check_id,
+                            "fsck_issue_id": issue.issue_id,
+                        },
                     )
+                    finish_action(index, "committed", mutation.get("operation_id"))
                 else:
+                    start_action(index)
                     self._vector.delete(action.memory_id)
+                    finish_action(index, "committed")
                 executed += 1
 
             elif action.action == "update" and action.memory_id:
@@ -1522,6 +2796,7 @@ class FsckService:
                         action.memory_id,
                     )
                     skipped += 1
+                    finish_action(index, "skipped")
                     continue
                 if existing.get("user_id") != user_id:
                     logger.warning(
@@ -1529,6 +2804,60 @@ class FsckService:
                         action.memory_id,
                     )
                     skipped += 1
+                    finish_action(index, "skipped")
+                    continue
+                if self._memory_service is not None:
+                    meta = {
+                        key: value
+                        for key, value in (action.new_metadata or {}).items()
+                        if key
+                        in {
+                            "memory_type",
+                            "categories",
+                            "importance",
+                            "pinned",
+                            "role",
+                            "labels",
+                        }
+                        and value is not None
+                    }
+                    if meta.get("memory_type") in ("fact", "preference"):
+                        from mnemory.prompts import _correct_memory_type
+
+                        source_text = action.new_content or existing.get("memory", "")
+                        if _correct_memory_type("fact", source_text) != "fact":
+                            meta.pop("memory_type", None)
+                    if meta.get("role") == "assistant" and not existing.get("agent_id"):
+                        meta.pop("role", None)
+                    kwargs: dict[str, Any] = {
+                        "user_id": user_id,
+                        "owner_id": existing.get("owner_id") or user_id,
+                        "content": action.new_content,
+                        "expected_revision": (expected_revisions or {}).get(
+                            action.memory_id,
+                            int((existing.get("metadata") or {}).get("revision", 1)),
+                        ),
+                        "idempotency_key": (
+                            f"fsck:{check_id}:{issue.issue_id}:"
+                            f"update:{action.memory_id}"
+                        ),
+                        "operation_kind": "fsck_update",
+                        "actor_kind": "fsck",
+                        "operation_reason": issue.type,
+                        "audit": {
+                            "fsck_check_id": check_id,
+                            "fsck_issue_id": issue.issue_id,
+                        },
+                    }
+                    kwargs.update(meta)
+                    if action.new_content is None:
+                        kwargs.pop("content")
+                    start_action(index)
+                    mutation = self._memory_service.update_memory(
+                        action.memory_id, **kwargs
+                    )
+                    executed += 1
+                    finish_action(index, "committed", mutation.get("operation_id"))
                     continue
                 if action.new_content:
                     # Generate sparse vector for hybrid search if available
@@ -1537,6 +2866,7 @@ class FsckService:
                         sparse_vector = self._memory_service._get_sparse_vector(
                             action.new_content
                         )
+                    start_action(index)
                     self._vector.update_content(
                         action.memory_id,
                         action.new_content,
@@ -1548,6 +2878,7 @@ class FsckService:
                         {"updated_at_utc": datetime.now(timezone.utc).isoformat()},
                     )
                     executed += 1
+                    finish_action(index, "committed")
                 if action.new_metadata:
                     # Filter to allowed metadata fields, dropping None values
                     # (None means "unchanged" in LLM output — don't overwrite).
@@ -1558,6 +2889,10 @@ class FsckService:
                         "pinned",
                         "role",
                         "labels",
+                        "evidence_root_ids",
+                        "validation_count",
+                        "validation_strength",
+                        "validation_projection_hash",
                     }
                     clean_meta = {
                         k: v
@@ -1665,29 +3000,55 @@ class FsckService:
                                 )
                                 del clean_meta["role"]
                         if clean_meta:
+                            start_action(index)
                             self._vector.update_metadata(action.memory_id, clean_meta)
                             executed += 1
+                            finish_action(index, "committed")
 
             elif action.action == "add" and action.new_content:
                 # Derive metadata from source memory when available.
                 # For split issues, the source is the memory being deleted.
                 source_meta: dict[str, Any] = {}
                 source_agent_id: str | None = None
+                source_owner_id = user_id
                 for other_action in issue.actions:
                     if other_action.action == "delete" and other_action.memory_id:
                         source = self._vector.get_by_id(other_action.memory_id)
                         if source:
                             source_meta = source.get("metadata") or {}
                             source_agent_id = source.get("agent_id")
+                            source_owner_id = source.get("owner_id") or user_id
                         break
 
                 if self._memory_service is not None:
                     meta = action.new_metadata or {}
+                    source_id = split_source_ids[0] if split_source_ids else None
+                    if source_id is None:
+                        for other_action in issue.actions:
+                            if (
+                                other_action.action == "delete"
+                                and other_action.memory_id
+                            ):
+                                source_id = other_action.memory_id
+                                break
+                    memory_id = str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            (
+                                f"mnemory:fsck:{check_id}:{issue.issue_id}:"
+                                f"{action.new_content}"
+                            ),
+                        )
+                    )
+                    from mnemory.revisions import RevisionService
+
+                    start_action(index)
                     self._memory_service.add_memory(
                         content=action.new_content,
                         user_id=user_id,
+                        owner_id=source_owner_id,
                         agent_id=source_agent_id or meta.get("agent_id"),
-                        role=source_meta.get("role") or meta.get("role"),
+                        role=source_meta.get("role") or meta.get("role") or "user",
                         memory_type=meta.get("memory_type")
                         or source_meta.get("memory_type"),
                         categories=meta.get("categories")
@@ -1699,6 +3060,13 @@ class FsckService:
                         event_date=source_meta.get("event_date"),
                         ttl_days=source_meta.get("ttl_days"),
                         infer=False,
+                        _trusted=True,
+                        _memory_id=memory_id,
+                        _revision_metadata=RevisionService.initial_metadata(
+                            memory_id,
+                            derived_from=[source_id] if source_id else None,
+                            source_session_id=None,
+                        ),
                     )
                 else:
                     # Fallback: direct vector store insert when MemoryService
@@ -1729,6 +3097,7 @@ class FsckService:
                     payload.setdefault("pinned", False)
 
                     point_id = str(uuid.uuid4())
+                    start_action(index)
                     self._vector._client.upsert(
                         collection_name=self._vector.collection_name,
                         points=[
@@ -1740,6 +3109,7 @@ class FsckService:
                         ],
                     )
                 executed += 1
+                finish_action(index, "committed")
 
         return executed, skipped
 

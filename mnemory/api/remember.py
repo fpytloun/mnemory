@@ -117,6 +117,8 @@ def _process_remember(
     timezone: str | None,
     context: str | None = None,
     labels: dict | None = None,
+    trusted_evidence: bool = False,
+    evidence_content: str | None = None,
 ) -> None:
     """Background task: extract and store memories from conversation content.
 
@@ -134,6 +136,8 @@ def _process_remember(
             session_timezone=timezone,
             context=context,
             labels=labels,
+            _trusted_evidence=trusted_evidence,
+            _evidence_content=evidence_content,
         )
 
         # Update session: prolong TTL and track stored memory IDs
@@ -153,7 +157,9 @@ def _process_remember(
                     session_id,
                 )
 
-        stored_count = len(result.get("results", []))
+        stored_count = sum(
+            item.get("event") in {"ADD", "UPDATE"} for item in result.get("results", [])
+        )
         if stored_count > 0:
             logger.info(
                 "Remember: stored %d memories for user=%s",
@@ -205,6 +211,11 @@ def remember(
     content = _format_messages(req.messages)
     if not content.strip():
         return RememberResponse(accepted=True)  # Nothing to process
+    user_evidence = "\n".join(
+        msg.content.strip()
+        for msg in req.messages
+        if msg.role == "user" and msg.content and msg.content.strip()
+    )
 
     # Fire-and-forget background processing
     background_tasks.add_task(
@@ -218,6 +229,8 @@ def remember(
         timezone=ctx.timezone,
         context=req.context,
         labels=req.labels,
+        trusted_evidence=ctx.trusted_evidence and bool(user_evidence),
+        evidence_content=user_evidence or None,
     )
 
     return RememberResponse(accepted=True)

@@ -22,6 +22,9 @@ from mnemory.api.schemas import (
     FsckApplyDetail,
     FsckApplyRequest,
     FsckApplyResponse,
+    FsckAuditRequest,
+    FsckReEvaluateRequest,
+    FsckReEvaluateResponse,
     FsckRequest,
     FsckStartResponse,
     FsckStatusResponse,
@@ -124,6 +127,8 @@ def _check_to_response(check) -> FsckStatusResponse:
         error=check.error,
         created_at=check.created_at_utc,
         expires_at=check.expires_at_utc,
+        mode=check.mode,
+        target_state=check.target_state,
     )
 
 
@@ -163,6 +168,7 @@ def start_fsck(
 
     check = fsck.start_check(
         user_id=ctx.user_id,
+        owner_id=ctx.owner_id,
         agent_id=agent_id,
     )
 
@@ -177,6 +183,31 @@ def start_fsck(
         incremental=req.incremental,
     )
 
+    return FsckStartResponse(check_id=check.check_id, status="running")
+
+
+@router.post("/audit", response_model=FsckStartResponse)
+def start_fsck_audit(
+    req: FsckAuditRequest,
+    background_tasks: BackgroundTasks,
+    ctx: SessionContext = Depends(get_session_context),
+):
+    """Start a bounded exact-revision audit that cannot mutate memories."""
+    _record("fsck_audit", ctx)
+    fsck = _get_fsck_service()
+    try:
+        check = fsck.start_exact_audit(
+            basis_operation_id=req.basis_operation_id,
+            targets=[target.model_dump() for target in req.targets],
+            user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    background_tasks.add_task(fsck.run_exact_audit, check.check_id)
     return FsckStartResponse(check_id=check.check_id, status="running")
 
 
@@ -228,7 +259,12 @@ def get_fsck_status(
 ):
     """Get the status and results of a memory check."""
     fsck = _get_fsck_service()
-    check = fsck.get_check(check_id)
+    check = fsck.get_check(
+        check_id,
+        user_id=ctx.user_id,
+        owner_id=ctx.owner_id,
+        session_agent_id=ctx.agent_id,
+    )
 
     if check is None:
         raise HTTPException(
@@ -253,7 +289,12 @@ def apply_fsck(
     _record("fsck_apply", ctx)
 
     fsck = _get_fsck_service()
-    check = fsck.get_check(check_id)
+    check = fsck.get_check(
+        check_id,
+        user_id=ctx.user_id,
+        owner_id=ctx.owner_id,
+        session_agent_id=ctx.agent_id,
+    )
 
     if check is None:
         raise HTTPException(
@@ -271,7 +312,13 @@ def apply_fsck(
             detail=f"Check is not completed (status: {check.status})",
         )
 
-    result = fsck.apply_check(check_id, issue_ids=req.issue_ids)
+    result = fsck.apply_check(
+        check_id,
+        issue_ids=req.issue_ids,
+        user_id=ctx.user_id,
+        owner_id=ctx.owner_id,
+        session_agent_id=ctx.agent_id,
+    )
 
     if result.get("error"):
         raise HTTPException(
@@ -296,3 +343,30 @@ def apply_fsck(
         failed=result.get("failed", 0),
         details=details,
     )
+
+
+@router.post(
+    "/operations/{operation_id}/re-evaluate",
+    response_model=FsckReEvaluateResponse,
+)
+def re_evaluate_fsck_operation(
+    operation_id: str,
+    req: FsckReEvaluateRequest,
+    ctx: SessionContext = Depends(get_session_context),
+):
+    """Compare an old operation with a fresh check without applying actions."""
+    fsck = _get_fsck_service()
+    try:
+        result = fsck.re_evaluate_operation(
+            operation_id,
+            fresh_check_id=req.fresh_check_id,
+            user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+            terminalize=req.terminalize,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return FsckReEvaluateResponse(**result)

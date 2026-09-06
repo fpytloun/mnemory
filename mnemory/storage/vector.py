@@ -18,9 +18,11 @@ from typing import Any, Literal
 
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
+    DatetimeRange,
     Distance,
     FieldCondition,
     Filter,
+    HasIdCondition,
     IsEmptyCondition,
     MatchAny,
     MatchValue,
@@ -29,10 +31,12 @@ from qdrant_client.models import (
     PointIdsList,
     PointStruct,
     VectorParams,
+    WriteOrdering,
 )
 
 from mnemory.config import Config
 from mnemory.embeddings import EmbeddingClient
+from mnemory.ttl import should_exclude
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +93,38 @@ def _build_owner_scope_condition(
             ),
         ]
     )
+
+
+def _active_revision_condition() -> Filter:
+    """Match active revisions and rolling-upgrade records without state."""
+    return Filter(
+        should=[
+            FieldCondition(
+                key="revision_state",
+                match=MatchValue(value="active"),
+            ),
+            IsEmptyCondition(is_empty=PayloadField(key="revision_state")),
+        ]
+    )
+
+
+def _collapse_active_revisions(memories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep the highest active revision from each lineage."""
+    selected: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for memory in memories:
+        metadata = memory.get("metadata") or {}
+        lineage_id = metadata.get("lineage_id") or memory["id"]
+        current = selected.get(lineage_id)
+        if current is None:
+            selected[lineage_id] = memory
+            order.append(lineage_id)
+            continue
+        current_revision = int((current.get("metadata") or {}).get("revision", 1))
+        revision = int(metadata.get("revision", 1))
+        if revision > current_revision:
+            selected[lineage_id] = memory
+    return [selected[lineage_id] for lineage_id in order]
 
 
 @contextmanager
@@ -218,7 +254,20 @@ class VectorStore:
 
         name = self.collection_name
         # Keyword/bool indexes for filtering
-        for field in ("user_id", "owner_id", "agent_id", "pinned", "memory_type"):
+        for field in (
+            "user_id",
+            "owner_id",
+            "agent_id",
+            "pinned",
+            "memory_type",
+            "lineage_id",
+            "revision_state",
+            "supersedes",
+            "derived_from",
+            "source_session_id",
+            "transition_token",
+            "revision_operation_key_hash",
+        ):
             try:
                 self._client.create_payload_index(
                     collection_name=name,
@@ -280,6 +329,7 @@ class VectorStore:
         metadata: dict[str, Any],
         role: str = "user",
         sparse_vector: Any = None,
+        memory_id: str | None = None,
     ) -> str:
         """Insert a new memory point.
 
@@ -297,7 +347,7 @@ class VectorStore:
         Returns:
             The generated memory ID (UUID string).
         """
-        memory_id = str(uuid.uuid4())
+        memory_id = memory_id or str(uuid.uuid4())
         now = datetime.now(timezone.utc)
 
         payload: dict[str, Any] = {
@@ -313,6 +363,15 @@ class VectorStore:
 
         # Merge custom metadata (memory_type, categories, importance, etc.)
         payload.update(metadata)
+        payload.setdefault(
+            "fact_hash",
+            _hash(" ".join(text.split()).casefold().encode()).hexdigest(),
+        )
+        payload.setdefault("consumed_evidence_root_ids", [])
+        if not payload.get("lineage_id"):
+            from mnemory.revisions import RevisionService
+
+            payload.update(RevisionService.initial_metadata(memory_id))
 
         # Use named vectors when sparse is available, unnamed otherwise
         point_vector: Any = (
@@ -348,7 +407,7 @@ class VectorStore:
         ids = []
 
         for p in points:
-            memory_id = str(uuid.uuid4())
+            memory_id = p.get("memory_id") or str(uuid.uuid4())
             ids.append(memory_id)
 
             payload: dict[str, Any] = {
@@ -362,6 +421,15 @@ class VectorStore:
             if p.get("agent_id"):
                 payload["agent_id"] = p["agent_id"]
             payload.update(p.get("metadata", {}))
+            payload.setdefault(
+                "fact_hash",
+                _hash(" ".join(p["text"].split()).casefold().encode()).hexdigest(),
+            )
+            payload.setdefault("consumed_evidence_root_ids", [])
+            if not payload.get("lineage_id"):
+                from mnemory.revisions import RevisionService
+
+                payload.update(RevisionService.initial_metadata(memory_id))
 
             # Use named vectors when sparse is available
             sparse_vec = p.get("sparse_vector")
@@ -462,7 +530,10 @@ class VectorStore:
         )
 
         # 2. Build filter conditions
-        must_conditions: list = [_build_owner_scope_condition(user_id, owner_id)]
+        must_conditions: list = [
+            _build_owner_scope_condition(user_id, owner_id),
+            _active_revision_condition(),
+        ]
         if subject_user_id:
             must_conditions.append(
                 FieldCondition(key="user_id", match=MatchValue(value=subject_user_id))
@@ -622,6 +693,7 @@ class VectorStore:
             mem = self._point_to_memory(point)
             mem["score"] = point.score
             memories.append(mem)
+        memories = _collapse_active_revisions(memories)[:limit]
 
         return {
             "results": memories,
@@ -663,7 +735,10 @@ class VectorStore:
         """
         from qdrant_client.models import DatetimeRange
 
-        must_conditions: list = [_build_owner_scope_condition(user_id, owner_id)]
+        must_conditions: list = [
+            _build_owner_scope_condition(user_id, owner_id),
+            _active_revision_condition(),
+        ]
         if subject_user_id:
             must_conditions.append(
                 FieldCondition(key="user_id", match=MatchValue(value=subject_user_id))
@@ -718,16 +793,25 @@ class VectorStore:
             with_payload=True,
         )
 
-        return [
+        memories = [
             {
                 "id": str(p.id),
                 "text": p.payload.get("data", ""),
                 "score": p.score,
                 "type": p.payload.get("memory_type", ""),
                 "categories": p.payload.get("categories", []),
+                "lineage_id": p.payload.get("lineage_id", str(p.id)),
+                "revision": p.payload.get("revision", 1),
             }
             for p in result.points
         ]
+        selected: dict[str, dict[str, Any]] = {}
+        for memory in memories:
+            lineage_id = memory["lineage_id"]
+            current = selected.get(lineage_id)
+            if current is None or int(memory["revision"]) > int(current["revision"]):
+                selected[lineage_id] = memory
+        return list(selected.values())[:limit]
 
     def get_by_id(self, memory_id: str) -> dict | None:
         """Get a single memory by ID.
@@ -747,6 +831,20 @@ class VectorStore:
         except Exception:
             logger.debug("Memory %s not found", memory_id)
             return None
+
+    def get_by_id_strict(self, memory_id: str) -> dict | None:
+        """Get one memory without converting backend failures to not-found."""
+        with _qdrant_timer("retrieve"):
+            result = self._client.retrieve(
+                collection_name=self.collection_name,
+                ids=[memory_id],
+                with_payload=True,
+                with_vectors=False,
+                consistency="all",
+            )
+        if not result:
+            return None
+        return self._point_to_memory(result[0])
 
     def get_by_ids(self, memory_ids: list[str]) -> list[dict]:
         """Get multiple memories by their IDs.
@@ -770,6 +868,21 @@ class VectorStore:
         except Exception:
             logger.warning("Failed to retrieve memories by IDs", exc_info=True)
             return []
+
+    def get_by_ids_strict(self, memory_ids: list[str]) -> list[dict]:
+        """Get exact memory revisions without hiding backend failures."""
+        memory_ids = list(dict.fromkeys(memory_ids))
+        if not memory_ids:
+            return []
+        with _qdrant_timer("retrieve"):
+            result = self._client.retrieve(
+                collection_name=self.collection_name,
+                ids=memory_ids,
+                with_payload=True,
+                with_vectors=False,
+                consistency="all",
+            )
+        return [self._point_to_memory(point) for point in result]
 
     def get_all(
         self,
@@ -803,7 +916,10 @@ class VectorStore:
 
         Returns dict with "results" key containing list of memory dicts.
         """
-        must_conditions: list = [_build_owner_scope_condition(user_id, owner_id)]
+        must_conditions: list = [
+            _build_owner_scope_condition(user_id, owner_id),
+            _active_revision_condition(),
+        ]
         if subject_user_id:
             must_conditions.append(
                 FieldCondition(key="user_id", match=MatchValue(value=subject_user_id))
@@ -877,10 +993,132 @@ class VectorStore:
                     key=lambda m: m.get(order_by.key, ""),  # type: ignore[union-attr]
                     reverse=reverse,
                 )
-                return {"results": results}
+                return {
+                    "results": _collapse_active_revisions(results)[:limit],
+                }
             raise
 
-        return {"results": [self._point_to_memory(p) for p in points]}
+        return {
+            "results": _collapse_active_revisions(
+                [self._point_to_memory(p) for p in points]
+            )[:limit]
+        }
+
+    def browse_active(
+        self,
+        *,
+        user_id: str,
+        owner_id: str | None,
+        session_agent_id: str | None,
+        cursor: str | int | None = None,
+        limit: int = 50,
+        memory_type: str | None = None,
+        categories: list[str] | None = None,
+        role: str | None = None,
+        labels_filter: dict[str, Any] | None = None,
+        memory_layer: str | None = None,
+        agent_id: str | None = None,
+        has_artifacts: bool = False,
+        decayed_only: bool = False,
+        include_decayed: bool = False,
+    ) -> dict[str, Any]:
+        """Return one authorized active-memory page in stable point-ID order."""
+        must: list[Any] = [
+            _build_owner_scope_condition(user_id, owner_id),
+            _active_revision_condition(),
+        ]
+        if memory_type:
+            must.append(
+                FieldCondition(key="memory_type", match=MatchValue(value=memory_type))
+            )
+        if role:
+            must.append(FieldCondition(key="role", match=MatchValue(value=role)))
+        if categories:
+            must.append(
+                FieldCondition(key="categories", match=MatchAny(any=categories))
+            )
+        if labels_filter:
+            must.extend(_build_labels_conditions(labels_filter))
+        if memory_layer == "raw":
+            must.append(
+                FieldCondition(key="memory_layer", match=MatchValue(value="raw"))
+            )
+        elif memory_layer == "consolidated":
+            must.append(
+                Filter(
+                    should=[
+                        FieldCondition(
+                            key="memory_layer",
+                            match=MatchValue(value="consolidated"),
+                        ),
+                        IsEmptyCondition(is_empty=PayloadField(key="memory_layer")),
+                    ]
+                )
+            )
+        if agent_id == "_none_":
+            must.append(IsEmptyCondition(is_empty=PayloadField(key="agent_id")))
+        elif agent_id:
+            must.append(
+                FieldCondition(key="agent_id", match=MatchValue(value=agent_id))
+            )
+        if has_artifacts:
+            must.append(
+                Filter(
+                    must_not=[IsEmptyCondition(is_empty=PayloadField(key="artifacts"))]
+                )
+            )
+        if decayed_only:
+            must.append(
+                Filter(
+                    must_not=[IsEmptyCondition(is_empty=PayloadField(key="decayed_at"))]
+                )
+            )
+
+        # Agent prefix authorization cannot be expressed safely as a Qdrant
+        # keyword filter. Scroll bounded chunks and discard inaccessible rows
+        # before the cursor leaves the server.
+        results: list[dict[str, Any]] = []
+        scroll_offset = cursor
+        next_offset = cursor
+        scanned = 0
+        max_scanned = 2000
+        while len(results) < limit and scanned < max_scanned:
+            batch_size = min(max(limit - len(results), 1), 200)
+            points, next_offset = self._client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=Filter(must=must),
+                limit=batch_size,
+                offset=scroll_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            scanned += len(points)
+            for point in points:
+                item = self._point_to_memory(point)
+                item_agent_id = item.get("agent_id")
+                if session_agent_id and item_agent_id:
+                    if (
+                        item_agent_id != session_agent_id
+                        and not item_agent_id.startswith(session_agent_id + ":")
+                    ):
+                        continue
+                if (
+                    not include_decayed
+                    and not decayed_only
+                    and should_exclude(item, False)
+                ):
+                    continue
+                results.append(item)
+                if len(results) == limit:
+                    break
+            if len(results) == limit or next_offset is None:
+                break
+            scroll_offset = next_offset
+
+        return {
+            "results": results,
+            "next_offset": str(next_offset) if next_offset is not None else None,
+        }
 
     def update_content(
         self,
@@ -1031,12 +1269,37 @@ class VectorStore:
 
         return len(results) > 0
 
+    def artifact_has_references_outside(
+        self,
+        *,
+        artifact_id: str,
+        excluded_memory_ids: list[str],
+    ) -> bool:
+        """Check for artifact references outside one memory lineage."""
+        results, _ = self._client.scroll(
+            collection_name=self.collection_name,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="artifacts[].id",
+                        match=MatchValue(value=artifact_id),
+                    )
+                ],
+                must_not=[HasIdCondition(has_id=excluded_memory_ids)],
+            ),
+            limit=1,
+            with_payload=False,
+            with_vectors=False,
+        )
+        return bool(results)
+
     # ── Fsck helpers ───────────────────────────────────────────────────
 
     def scroll_with_vectors(
         self,
         *,
         user_id: str,
+        owner_id: str | None = None,
         agent_id: str | None = None,
         shared_only: bool = False,
         filters: dict | None = None,
@@ -1068,7 +1331,8 @@ class VectorStore:
         from qdrant_client.models import IsEmptyCondition, MatchAny
 
         must_conditions: list = [
-            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            _build_owner_scope_condition(user_id, owner_id or user_id),
+            _active_revision_condition(),
         ]
         must_not_conditions: list = []
 
@@ -1150,7 +1414,7 @@ class VectorStore:
                 break
             offset = next_offset
 
-        return results
+        return _collapse_active_revisions(results)
 
     def scroll_gc_metadata(self, *, user_id: str) -> list[dict[str, Any]]:
         """Scroll lightweight metadata used by superseded raw-memory GC."""
@@ -1216,6 +1480,7 @@ class VectorStore:
 
         must_conditions: list = [
             FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            _active_revision_condition(),
         ]
         if agent_id:
             must_conditions.append(
@@ -1243,7 +1508,7 @@ class VectorStore:
             mem = self._point_to_memory(point)
             mem["score"] = point.score
             memories.append(mem)
-        return memories
+        return _collapse_active_revisions(memories)[:limit]
 
     def search_by_vector_ids(
         self,
@@ -1274,6 +1539,7 @@ class VectorStore:
 
         must_conditions: list = [
             FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            _active_revision_condition(),
         ]
         if agent_id:
             must_conditions.append(
@@ -1334,6 +1600,7 @@ class VectorStore:
 
         must_conditions: list = [
             _build_owner_scope_condition(user_id, owner_id),
+            _active_revision_condition(),
             FieldCondition(
                 key="created_at",
                 range=DatetimeRange(gte=since),
@@ -1396,7 +1663,7 @@ class VectorStore:
         # Sort by created_at descending (most recent first)
         results.sort(key=lambda m: m.get("created_at", ""), reverse=True)
 
-        return results
+        return _collapse_active_revisions(results)[:limit]
 
     def get_pinned_memories(
         self,
@@ -1592,7 +1859,13 @@ class VectorStore:
         return memory
 
 
-def _session_point_id(session_id: str) -> str:
+def _session_point_id(
+    session_id: str,
+    *,
+    user_id: str | None = None,
+    owner_id: str | None = None,
+    agent_id: str | None = None,
+) -> str:
     """Convert a session ID string to a deterministic UUID for Qdrant.
 
     Qdrant point IDs must be UUIDs or unsigned integers. Session IDs
@@ -1601,7 +1874,12 @@ def _session_point_id(session_id: str) -> str:
     """
     import uuid as _uuid
 
-    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"mnemory:session:{session_id}"))
+    scope = (
+        session_id
+        if user_id is None
+        else f"{owner_id or user_id}:{user_id}:{agent_id or ''}:{session_id}"
+    )
+    return str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"mnemory:session:{scope}"))
 
 
 class SessionSummaryStore:
@@ -1623,14 +1901,52 @@ class SessionSummaryStore:
     def __init__(self, client: QdrantClient):
         self._client = client
 
+    def _resolve_point_id(self, session_id: str) -> str:
+        """Resolve an unscoped internal session lookup when it is unique."""
+        points, _ = self._client.scroll(
+            collection_name=self.COLLECTION,
+            scroll_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="session_id",
+                        match=MatchValue(value=session_id),
+                    )
+                ]
+            ),
+            limit=2,
+            with_payload=False,
+            with_vectors=False,
+        )
+        if len(points) != 1:
+            return _session_point_id(session_id)
+        return str(points[0].id)
+
+    @staticmethod
+    def get_point_id(
+        session_id: str,
+        *,
+        user_id: str | None = None,
+        owner_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> str:
+        """Return the deterministic Qdrant point ID for a session."""
+        return _session_point_id(
+            session_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+        )
+
     def upsert(
         self,
         *,
         session_id: str,
         user_id: str,
+        owner_id: str | None = None,
         agent_id: str | None = None,
         summary: str,
         new_memory_ids: list[str] | None = None,
+        _attempt: int = 0,
     ) -> None:
         """Create or update a session summary.
 
@@ -1645,13 +1961,39 @@ class SessionSummaryStore:
             new_memory_ids: IDs of raw memories created in this remember call.
         """
         now = datetime.now(timezone.utc).isoformat()
+        owner_id = owner_id or user_id
+        self._write_session_append_events(
+            session_id=session_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            memory_ids=new_memory_ids or [],
+        )
+        point_id = _session_point_id(
+            session_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+        )
 
         # Try to read existing
-        existing = self.get(session_id)
+        existing = self.get(
+            session_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+        )
 
         if existing:
+            point_id = existing.get("_point_id") or point_id
+            if (
+                existing.get("user_id") != user_id
+                or (existing.get("owner_id") or existing.get("user_id")) != owner_id
+                or existing.get("agent_id") != agent_id
+            ):
+                raise ValueError("Session ID belongs to a different access scope")
             # Update existing
-            memory_ids = existing.get("memory_ids", [])
+            memory_ids = list(existing.get("memory_ids", []))
             if new_memory_ids:
                 memory_ids.extend(new_memory_ids)
             turn_count = existing.get("turn_count", 0) + 1
@@ -1659,38 +2001,106 @@ class SessionSummaryStore:
             # Re-consolidation: reset state to idle when new memories
             # arrive after consolidation, making the session eligible
             # for re-consolidation on the next check cycle.
-            # Race condition note: if consolidation is running concurrently,
-            # last-writer-wins — both idle and consolidated are valid end
-            # states, and the idle threshold prevents immediate re-trigger.
             consolidation_state = existing.get("consolidation_state", "idle")
-            if consolidation_state == "consolidated" and new_memory_ids:
+            if consolidation_state in ("consolidated", "failed") and new_memory_ids:
                 consolidation_state = "idle"
 
+            update_token = str(uuid.uuid4())
             payload = {
                 "session_id": session_id,
                 "user_id": user_id,
+                "owner_id": owner_id,
                 "summary": summary,
                 "turn_count": turn_count,
                 "memory_ids": memory_ids,
                 "updated_at": now,
                 "created_at": existing.get("created_at", now),
                 "consolidation_state": consolidation_state,
+                "attempt_count": existing.get("attempt_count", 0),
+                "session_revision": int(existing.get("session_revision", 1)) + 1,
+                "session_update_token": update_token,
             }
             if agent_id:
                 payload["agent_id"] = agent_id
-            elif existing.get("agent_id"):
-                payload["agent_id"] = existing["agent_id"]
+            must: list[Any] = [
+                HasIdCondition(has_id=[point_id]),
+                FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                FieldCondition(key="owner_id", match=MatchValue(value=owner_id)),
+                FieldCondition(
+                    key="session_revision",
+                    match=MatchValue(value=int(existing.get("session_revision", 1))),
+                ),
+                FieldCondition(
+                    key="consolidation_state",
+                    match=MatchValue(value=existing.get("consolidation_state", "idle")),
+                ),
+            ]
+            existing_claim = existing.get("consolidation_token")
+            if existing_claim:
+                must.append(
+                    FieldCondition(
+                        key="consolidation_token",
+                        match=MatchValue(value=existing_claim),
+                    )
+                )
+            else:
+                must.append(
+                    IsEmptyCondition(is_empty=PayloadField(key="consolidation_token"))
+                )
+            self._client.set_payload(
+                collection_name=self.COLLECTION,
+                payload=payload,
+                points=Filter(must=must),
+                wait=True,
+                ordering=WriteOrdering.STRONG,
+            )
+            written = self.get(session_id, point_id=point_id)
+            if not written or written.get("session_update_token") != update_token:
+                if _attempt >= 7:
+                    raise RuntimeError("Concurrent session updates did not converge")
+                return self.upsert(
+                    session_id=session_id,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    agent_id=agent_id,
+                    summary=summary,
+                    new_memory_ids=new_memory_ids,
+                    _attempt=_attempt + 1,
+                )
+            clear_keys = ["session_update_token"]
+            if (
+                consolidation_state == "idle"
+                and existing.get("consolidation_state") == "failed"
+            ):
+                clear_keys.extend(
+                    [
+                        "last_error_code",
+                        "last_error_at",
+                        "consolidation_token",
+                        "consolidation_plan",
+                    ]
+                )
+            self._client.delete_payload(
+                collection_name=self.COLLECTION,
+                keys=clear_keys,
+                points=[point_id],
+                wait=True,
+            )
+            return
         else:
             # Create new
             payload = {
                 "session_id": session_id,
                 "user_id": user_id,
+                "owner_id": owner_id,
                 "summary": summary,
                 "turn_count": 1,
                 "memory_ids": new_memory_ids or [],
                 "created_at": now,
                 "updated_at": now,
                 "consolidation_state": "idle",
+                "attempt_count": 0,
+                "session_revision": 1,
             }
             if agent_id:
                 payload["agent_id"] = agent_id
@@ -1699,29 +2109,182 @@ class SessionSummaryStore:
             collection_name=self.COLLECTION,
             points=[
                 PointStruct(
-                    id=_session_point_id(session_id),
+                    id=point_id,
                     vector=[0.0],  # dummy vector
                     payload=payload,
                 )
             ],
         )
 
-    def get(self, session_id: str) -> dict | None:
+    def get(
+        self,
+        session_id: str,
+        *,
+        user_id: str | None = None,
+        owner_id: str | None = None,
+        agent_id: str | None = None,
+        point_id: str | None = None,
+    ) -> dict | None:
         """Get a session summary by ID.
 
         Returns the session dict, or None if not found.
         """
-        try:
+        resolved_id = point_id or _session_point_id(
+            session_id,
+            user_id=user_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+        )
+        result = self._client.retrieve(
+            collection_name=self.COLLECTION,
+            ids=[resolved_id],
+            with_payload=True,
+            consistency="all",
+        )
+        if not result and user_id is not None and point_id is None:
             result = self._client.retrieve(
                 collection_name=self.COLLECTION,
                 ids=[_session_point_id(session_id)],
                 with_payload=True,
+                consistency="all",
             )
-            if result:
-                return dict(result[0].payload or {})
-        except Exception:
-            logger.debug("Session summary %s not found", session_id)
+        if not result and user_id is None and point_id is None:
+            result = self._client.retrieve(
+                collection_name=self.COLLECTION,
+                ids=[self._resolve_point_id(session_id)],
+                with_payload=True,
+                consistency="all",
+            )
+        if result:
+            payload = dict(result[0].payload or {})
+            if user_id is not None and (
+                payload.get("user_id") != user_id
+                or (payload.get("owner_id") or payload.get("user_id"))
+                != (owner_id or user_id)
+                or payload.get("agent_id") != agent_id
+            ):
+                return None
+            payload["_point_id"] = str(result[0].id)
+            payload["memory_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *(payload.get("memory_ids") or []),
+                        *self._session_append_ids(payload),
+                    ]
+                )
+            )
+            return payload
         return None
+
+    def _write_session_append_events(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        owner_id: str,
+        agent_id: str | None,
+        memory_ids: list[str],
+    ) -> None:
+        """Persist session-memory links before the mutable summary projection."""
+        if not memory_ids:
+            return
+        from mnemory.revisions import OPERATIONS_COLLECTION
+
+        collections = {item.name for item in self._client.get_collections().collections}
+        if OPERATIONS_COLLECTION not in collections:
+            self._client.create_collection(
+                collection_name=OPERATIONS_COLLECTION,
+                vectors_config=VectorParams(size=1, distance=Distance.COSINE),
+            )
+        points = []
+        now = datetime.now(timezone.utc).isoformat()
+        for memory_id in dict.fromkeys(memory_ids):
+            event_id = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    (
+                        f"mnemory:session-append:{owner_id}:{user_id}:"
+                        f"{agent_id or ''}:{session_id}:{memory_id}"
+                    ),
+                )
+            )
+            payload = {
+                "operation_id": event_id,
+                "operation_kind": "session_append",
+                "status": "committed",
+                "actor_kind": "remember",
+                "user_id": user_id,
+                "owner_id": owner_id,
+                "session_id": session_id,
+                "lineage_id": memory_id,
+                "affected_lineage_ids": [memory_id],
+                "memory_id": memory_id,
+                "created_at_utc": now,
+                "updated_at_utc": now,
+            }
+            if agent_id:
+                payload["agent_id"] = agent_id
+            points.append(PointStruct(id=event_id, vector=[0.0], payload=payload))
+        self._client.upsert(
+            collection_name=OPERATIONS_COLLECTION,
+            points=points,
+            wait=True,
+        )
+
+    def _session_append_ids(self, session: dict[str, Any]) -> list[str]:
+        """Read append-only memory links for one session scope."""
+        from mnemory.revisions import OPERATIONS_COLLECTION
+
+        collections = {item.name for item in self._client.get_collections().collections}
+        if OPERATIONS_COLLECTION not in collections:
+            return []
+        must: list[Any] = [
+            FieldCondition(
+                key="operation_kind",
+                match=MatchValue(value="session_append"),
+            ),
+            FieldCondition(
+                key="session_id",
+                match=MatchValue(value=session["session_id"]),
+            ),
+            FieldCondition(
+                key="user_id",
+                match=MatchValue(value=session["user_id"]),
+            ),
+            FieldCondition(
+                key="owner_id",
+                match=MatchValue(value=session.get("owner_id") or session["user_id"]),
+            ),
+        ]
+        if session.get("agent_id"):
+            must.append(
+                FieldCondition(
+                    key="agent_id",
+                    match=MatchValue(value=session["agent_id"]),
+                )
+            )
+        else:
+            must.append(IsEmptyCondition(is_empty=PayloadField(key="agent_id")))
+        points = []
+        offset = None
+        while True:
+            page, next_offset = self._client.scroll(
+                collection_name=OPERATIONS_COLLECTION,
+                scroll_filter=Filter(must=must),
+                limit=256,
+                offset=offset,
+                with_payload=["memory_id"],
+                with_vectors=False,
+            )
+            points.extend(page)
+            if next_offset is None:
+                break
+            offset = next_offset
+        return [
+            point.payload["memory_id"]
+            for point in points
+            if point.payload and point.payload.get("memory_id")
+        ]
 
     def find_pending(
         self,
@@ -1753,6 +2316,9 @@ class SessionSummaryStore:
                         key="consolidation_state",
                         match=MatchValue(value="idle"),
                     ),
+                    IsEmptyCondition(
+                        is_empty=PayloadField(key="retry_operation_token")
+                    ),
                 ]
             ),
             limit=100,
@@ -1766,6 +2332,29 @@ class SessionSummaryStore:
             # Skip entries with missing session_id (corrupted/legacy data)
             if not payload.get("session_id"):
                 continue
+            expected_ids = {
+                _session_point_id(payload["session_id"]),
+                _session_point_id(
+                    payload["session_id"],
+                    user_id=payload.get("user_id"),
+                    owner_id=payload.get("owner_id"),
+                    agent_id=payload.get("agent_id"),
+                ),
+            }
+            if str(point.id) not in expected_ids:
+                logger.warning(
+                    "Legacy session point id detected: session_id=%s point_id=%s",
+                    payload["session_id"],
+                    point.id,
+                )
+            payload["memory_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *(payload.get("memory_ids") or []),
+                        *self._session_append_ids(payload),
+                    ]
+                )
+            )
             updated_at_str = payload.get("updated_at", "")
             if updated_at_str:
                 try:
@@ -1775,6 +2364,7 @@ class SessionSummaryStore:
                     if updated_at < cutoff:
                         # Only include sessions that have at least one memory
                         if payload.get("memory_ids"):
+                            payload["_point_id"] = str(point.id)
                             sessions.append(payload)
                 except (ValueError, TypeError):
                     pass
@@ -1788,17 +2378,24 @@ class SessionSummaryStore:
         payload_fields = [
             "session_id",
             "user_id",
+            "owner_id",
+            "agent_id",
             "memory_ids",
             "updated_at",
             "consolidation_state",
             "consolidated_memory_ids",
+            "session_revision",
+            "consolidation_token",
+            "consolidation_plan",
+            "session_update_token",
         ]
         scroll_filter = Filter(
             must=[
                 FieldCondition(
                     key="consolidation_state",
                     match=MatchAny(any=["idle", "consolidating"]),
-                )
+                ),
+                IsEmptyCondition(is_empty=PayloadField(key="retry_operation_token")),
             ]
         )
 
@@ -1814,6 +2411,31 @@ class SessionSummaryStore:
             for point in points:
                 payload = dict(point.payload or {})
                 if payload.get("session_id") and payload.get("user_id"):
+                    expected_ids = {
+                        _session_point_id(payload["session_id"]),
+                        _session_point_id(
+                            payload["session_id"],
+                            user_id=payload.get("user_id"),
+                            owner_id=payload.get("owner_id"),
+                            agent_id=payload.get("agent_id"),
+                        ),
+                    }
+                    if str(point.id) not in expected_ids:
+                        logger.warning(
+                            "Legacy session point id detected: "
+                            "session_id=%s point_id=%s",
+                            payload["session_id"],
+                            point.id,
+                        )
+                    payload["memory_ids"] = list(
+                        dict.fromkeys(
+                            [
+                                *(payload.get("memory_ids") or []),
+                                *self._session_append_ids(payload),
+                            ]
+                        )
+                    )
+                    payload["_point_id"] = str(point.id)
                     sessions.append(payload)
             if next_offset is None:
                 break
@@ -1827,6 +2449,11 @@ class SessionSummaryStore:
         state: str,
         *,
         consolidated_memory_ids: list[str] | None = None,
+        attempt_count: int | None = None,
+        error_code: str | None = None,
+        consolidation_token: str | None | type(Ellipsis) = ...,
+        consolidation_plan: list[dict[str, Any]] | None | type(Ellipsis) = ...,
+        point_id: str | None = None,
     ) -> None:
         """Update the consolidation state of a session.
 
@@ -1841,35 +2468,414 @@ class SessionSummaryStore:
         }
         if state == "consolidated":
             payload_update["consolidated_at"] = datetime.now(timezone.utc).isoformat()
+        if state in ("idle", "consolidated"):
+            payload_update["last_error_code"] = None
+            payload_update["last_error_at"] = None
+            payload_update["legacy_failure"] = False
+            payload_update["failure_class"] = None
+            payload_update["failure_schema_version"] = 1
+            payload_update["retry_operation_token"] = None
+            payload_update["retry_claimant"] = None
+            payload_update["retry_lease_expires_at"] = None
+        if attempt_count is not None:
+            payload_update["attempt_count"] = attempt_count
+        if error_code is not None:
+            payload_update["last_error_code"] = error_code
+            payload_update["last_error_at"] = datetime.now(timezone.utc).isoformat()
+            payload_update["legacy_failure"] = False
+            payload_update["failure_schema_version"] = 1
+            lowered = error_code.lower()
+            if "timeout" in lowered:
+                failure_class = "timeout"
+            elif "auth" in lowered or "permission" in lowered:
+                failure_class = "authorization_error"
+            elif "schema" in lowered or "validation" in lowered:
+                failure_class = "schema_error"
+            elif "conflict" in lowered:
+                failure_class = "conflict"
+            elif any(value in lowered for value in ("qdrant", "storage", "connection")):
+                failure_class = "storage_error"
+            elif any(value in lowered for value in ("llm", "model", "openai")):
+                failure_class = "model_error"
+            else:
+                failure_class = "internal_error"
+            payload_update["failure_class"] = failure_class
+            payload_update["retry_operation_token"] = None
+            payload_update["retry_claimant"] = None
+            payload_update["retry_lease_expires_at"] = None
         if consolidated_memory_ids is not None:
             payload_update["consolidated_memory_ids"] = consolidated_memory_ids
+        if consolidation_token is not ...:
+            payload_update["consolidation_token"] = consolidation_token
+        if consolidation_plan is not ...:
+            payload_update["consolidation_plan"] = consolidation_plan
 
         self._client.set_payload(
             collection_name=self.COLLECTION,
             payload=payload_update,
-            points=[_session_point_id(session_id)],
+            points=[point_id or self._resolve_point_id(session_id)],
         )
 
-    def delete(self, session_id: str) -> dict | None:
+    def claim_consolidation(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int,
+        token: str,
+        attempt_count: int,
+        point_id: str | None = None,
+    ) -> bool:
+        """Claim one session revision for cross-replica consolidation."""
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "consolidation_state": "consolidating",
+                "consolidation_token": token,
+                "attempt_count": attempt_count,
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(
+                        has_id=[point_id or self._resolve_point_id(session_id)]
+                    ),
+                    FieldCondition(
+                        key="consolidation_state",
+                        match=MatchValue(value="idle"),
+                    ),
+                    FieldCondition(
+                        key="session_revision",
+                        match=MatchValue(value=expected_revision),
+                    ),
+                    IsEmptyCondition(is_empty=PayloadField(key="consolidation_token")),
+                ]
+            ),
+            wait=True,
+            ordering=WriteOrdering.STRONG,
+        )
+        claimed = self.get(session_id, point_id=point_id)
+        return bool(claimed and claimed.get("consolidation_token") == token)
+
+    def finalize_consolidation(
+        self,
+        session_id: str,
+        *,
+        expected_revision: int,
+        token: str,
+        consolidated_memory_ids: list[str],
+        point_id: str | None = None,
+    ) -> str:
+        """Finalize one claimed generation or leave a newer generation idle."""
+        now = datetime.now(timezone.utc).isoformat()
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "consolidation_state": "consolidated",
+                "consolidated_memory_ids": consolidated_memory_ids,
+                "consolidated_at": now,
+                "consolidation_token": None,
+                "consolidation_plan": None,
+                "retry_operation_token": None,
+                "retry_claimant": None,
+                "retry_lease_expires_at": None,
+                "last_error_code": None,
+                "last_error_at": None,
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(
+                        has_id=[point_id or self._resolve_point_id(session_id)]
+                    ),
+                    FieldCondition(
+                        key="session_revision",
+                        match=MatchValue(value=expected_revision),
+                    ),
+                    FieldCondition(
+                        key="consolidation_state",
+                        match=MatchValue(value="consolidating"),
+                    ),
+                    FieldCondition(
+                        key="consolidation_token",
+                        match=MatchValue(value=token),
+                    ),
+                ]
+            ),
+            wait=True,
+            ordering=WriteOrdering.STRONG,
+        )
+        current = self.get(session_id, point_id=point_id)
+        if (
+            current
+            and int(current.get("session_revision", 1)) == expected_revision
+            and current.get("consolidation_state") == "consolidated"
+            and not current.get("consolidation_token")
+        ):
+            return "consolidated"
+
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "consolidation_state": "idle",
+                "consolidated_memory_ids": consolidated_memory_ids,
+                "consolidation_token": None,
+                "consolidation_plan": None,
+                "retry_operation_token": None,
+                "retry_claimant": None,
+                "retry_lease_expires_at": None,
+                "last_error_code": None,
+                "last_error_at": None,
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(
+                        has_id=[point_id or self._resolve_point_id(session_id)]
+                    ),
+                    FieldCondition(
+                        key="consolidation_state",
+                        match=MatchValue(value="consolidating"),
+                    ),
+                    FieldCondition(
+                        key="consolidation_token",
+                        match=MatchValue(value=token),
+                    ),
+                ]
+            ),
+            wait=True,
+            ordering=WriteOrdering.STRONG,
+        )
+        current = self.get(session_id, point_id=point_id)
+        if current and current.get("consolidation_state") == "idle":
+            return "idle"
+        raise RuntimeError("Consolidation finalization did not converge")
+
+    def delete(
+        self,
+        session_id: str,
+        *,
+        point_id: str | None = None,
+    ) -> dict | None:
         """Delete a session summary by ID.
 
         Returns the session payload before deletion, or None if not found.
         The caller can use the returned payload to clean up linked memories.
         """
         # Read the session first so we can return its data
-        session = self.get(session_id)
+        session = self.get(session_id, point_id=point_id)
 
         self._client.delete(
             collection_name=self.COLLECTION,
-            points_selector=PointIdsList(points=[_session_point_id(session_id)]),
+            points_selector=PointIdsList(
+                points=[point_id or self._resolve_point_id(session_id)]
+            ),
+        )
+        if session is not None:
+            from mnemory.revisions import OPERATIONS_COLLECTION
+
+            if self._client.collection_exists(OPERATIONS_COLLECTION):
+                must: list[Any] = [
+                    FieldCondition(
+                        key="operation_kind",
+                        match=MatchValue(value="session_append"),
+                    ),
+                    FieldCondition(
+                        key="session_id",
+                        match=MatchValue(value=session_id),
+                    ),
+                    FieldCondition(
+                        key="user_id",
+                        match=MatchValue(value=session["user_id"]),
+                    ),
+                    FieldCondition(
+                        key="owner_id",
+                        match=MatchValue(
+                            value=session.get("owner_id") or session["user_id"]
+                        ),
+                    ),
+                ]
+                if session.get("agent_id"):
+                    must.append(
+                        FieldCondition(
+                            key="agent_id",
+                            match=MatchValue(value=session["agent_id"]),
+                        )
+                    )
+                else:
+                    must.append(IsEmptyCondition(is_empty=PayloadField(key="agent_id")))
+                self._client.delete(
+                    collection_name=OPERATIONS_COLLECTION,
+                    points_selector=Filter(must=must),
+                    wait=True,
+                )
+        return session
+
+    def reset_failed_for_retry(
+        self,
+        session_id: str,
+        *,
+        point_id: str,
+        expected_revision: int,
+        retry_token: str,
+        retry_claimant: str,
+        retry_lease_seconds: int,
+    ) -> dict | None:
+        """Atomically reset one unclaimed failed session for explicit retry."""
+        next_revision = expected_revision + 1
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "consolidation_state": "idle",
+                "session_revision": next_revision,
+                "last_error_code": None,
+                "last_error_at": None,
+                "legacy_failure": False,
+                "failure_class": None,
+                "failure_schema_version": 1,
+                "retry_operation_token": retry_token,
+                "retry_claimant": retry_claimant,
+                "retry_lease_expires_at": (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=max(retry_lease_seconds, 1))
+                ).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[point_id]),
+                    FieldCondition(
+                        key="consolidation_state",
+                        match=MatchValue(value="failed"),
+                    ),
+                    FieldCondition(
+                        key="session_revision",
+                        match=MatchValue(value=expected_revision),
+                    ),
+                    IsEmptyCondition(is_empty=PayloadField(key="consolidation_token")),
+                    IsEmptyCondition(is_empty=PayloadField(key="consolidation_plan")),
+                ]
+            ),
+            wait=True,
+        )
+        current = self.get(
+            session_id,
+            point_id=point_id,
+        )
+        if (
+            current
+            and current.get("consolidation_state") == "idle"
+            and current.get("session_revision") == next_revision
+            and current.get("retry_operation_token") == retry_token
+            and current.get("retry_claimant") == retry_claimant
+        ):
+            return current
+        return None
+
+    def renew_retry_claim(
+        self,
+        session_id: str,
+        *,
+        point_id: str,
+        retry_token: str,
+        retry_claimant: str,
+        retry_lease_seconds: int,
+    ) -> bool:
+        """Renew a retry session lease for its current claimant."""
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=max(retry_lease_seconds, 1))).isoformat()
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "retry_lease_expires_at": expires_at,
+                "updated_at": now.isoformat(),
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[point_id]),
+                    FieldCondition(
+                        key="retry_operation_token",
+                        match=MatchValue(value=retry_token),
+                    ),
+                    FieldCondition(
+                        key="retry_claimant",
+                        match=MatchValue(value=retry_claimant),
+                    ),
+                    FieldCondition(
+                        key="retry_lease_expires_at",
+                        range=DatetimeRange(gte=now),
+                    ),
+                    FieldCondition(
+                        key="consolidation_state",
+                        match=MatchAny(any=["idle", "consolidating"]),
+                    ),
+                ]
+            ),
+            wait=True,
+        )
+        current = self.get(session_id, point_id=point_id)
+        return bool(
+            current
+            and current.get("retry_operation_token") == retry_token
+            and current.get("retry_claimant") == retry_claimant
+            and current.get("retry_lease_expires_at") == expires_at
         )
 
-        return session
+    def transfer_retry_claim(
+        self,
+        session_id: str,
+        *,
+        point_id: str,
+        retry_token: str,
+        previous_claimant: str,
+        retry_claimant: str,
+        retry_lease_seconds: int,
+    ) -> dict | None:
+        """Transfer an expired retry session lease to a new claimant."""
+        now = datetime.now(timezone.utc)
+        expires_at = (now + timedelta(seconds=max(retry_lease_seconds, 1))).isoformat()
+        self._client.set_payload(
+            collection_name=self.COLLECTION,
+            payload={
+                "retry_claimant": retry_claimant,
+                "retry_lease_expires_at": expires_at,
+                "updated_at": now.isoformat(),
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[point_id]),
+                    FieldCondition(
+                        key="retry_operation_token",
+                        match=MatchValue(value=retry_token),
+                    ),
+                    FieldCondition(
+                        key="retry_claimant",
+                        match=MatchValue(value=previous_claimant),
+                    ),
+                    FieldCondition(
+                        key="retry_lease_expires_at",
+                        range=DatetimeRange(lte=now),
+                    ),
+                    FieldCondition(
+                        key="consolidation_state",
+                        match=MatchAny(any=["idle", "consolidating"]),
+                    ),
+                ]
+            ),
+            wait=True,
+        )
+        current = self.get(session_id, point_id=point_id)
+        if (
+            current
+            and current.get("retry_operation_token") == retry_token
+            and current.get("retry_claimant") == retry_claimant
+            and current.get("retry_lease_expires_at") == expires_at
+        ):
+            return current
+        return None
 
     def list_for_user(
         self,
         user_id: str,
         *,
+        owner_id: str | None = None,
+        session_agent_id: str | None = None,
         limit: int = 50,
         consolidation_state: str | None = None,
         offset: int = 0,
@@ -1898,6 +2904,10 @@ class SessionSummaryStore:
         """
         must_conditions = [
             FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(
+                key="owner_id",
+                match=MatchValue(value=owner_id or user_id),
+            ),
         ]
         if consolidation_state:
             must_conditions.append(
@@ -1928,6 +2938,14 @@ class SessionSummaryStore:
 
                 for point in points:
                     payload = dict(point.payload or {})
+                    memory_agent_id = payload.get("agent_id")
+                    if (
+                        session_agent_id
+                        and memory_agent_id
+                        and memory_agent_id != session_agent_id
+                        and not memory_agent_id.startswith(session_agent_id + ":")
+                    ):
+                        continue
                     # Skip entries with empty/corrupted payload
                     if (
                         not payload

@@ -204,6 +204,57 @@
     @apply bg-brand-surface border border-brand-border rounded-xl
            shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6;
   }
+
+  .detail-tab {
+    @apply shrink-0 px-4 py-3 text-sm text-secondary border-b-2 border-transparent
+           hover:text-[#E6EDF3] focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-accent;
+  }
+
+  .detail-tab-active {
+    @apply text-brand-accent border-brand-accent;
+  }
+
+  .detail-grid {
+    @apply grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm;
+  }
+
+  .detail-grid > div {
+    @apply rounded-lg bg-brand-elevated p-3 min-w-0;
+  }
+
+  .detail-grid dt {
+    @apply text-xs text-muted;
+  }
+
+  .detail-grid dd {
+    @apply mt-1 text-secondary break-words;
+  }
+
+  .timeline {
+    @apply space-y-3 border-l border-brand-border pl-5;
+  }
+
+  .timeline > li {
+    @apply relative rounded-lg bg-brand-elevated p-4;
+  }
+
+  .timeline > li::before {
+    content: "";
+    @apply absolute -left-[1.55rem] top-5 h-2.5 w-2.5 rounded-full bg-brand-accent;
+  }
+
+  .danger-panel {
+    @apply rounded-lg border border-red-500/30 bg-red-500/10 p-4 text-sm text-red-200;
+  }
+
+  .warning-panel {
+    @apply rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-200;
+  }
+
+  .link-card {
+    @apply block w-full rounded-lg border border-brand-border bg-brand-elevated p-3
+           hover:border-brand-accent/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-accent;
+  }
 }
 
 /* ── Utility additions ── */
@@ -222,5 +273,13 @@
   }
   .fade-enter-from, .fade-leave-to {
     opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
   }
 }

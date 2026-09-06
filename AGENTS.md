@@ -198,6 +198,20 @@ Custom metadata is stored as flat fields in the Qdrant payload alongside standar
 | `memory_layer` | str | "raw" (from remember) or "consolidated" (from add_memory, consolidation, or pre-existing). Controls recall ranking and dedup scope. Absent = treated as "consolidated" for backward compatibility. **Exception**: the consolidation service treats absent `memory_layer` as "raw" when fetching memories for consolidation, since pre-existing memories linked to sessions were created by the remember pipeline before the two-layer system. |
 | `superseded_by` | str\|None | ID of the consolidated memory that replaced this raw memory (None = not superseded). Set by the consolidation service. |
 | `derived_from` | list[str]\|None | IDs of source raw memories (on consolidated memories produced by consolidation). |
+| `lineage_id` | str | Stable assertion lineage. The first revision ID is the lineage ID. |
+| `revision` | int | Monotonic revision number within a lineage. |
+| `revision_state` | str | `pending`, `active`, `superseded`, `source`, `retracted`, or `aborted`. |
+| `supersedes` | str\|None | Previous semantic revision ID in the same lineage. |
+| `revision_successor_id` | str\|None | One-time backlink to the successor revision. |
+| `revision_operation_id` | str\|None | Durable operation and audit record ID. |
+| `provenance_quality` | str | `exact` for new provenance or `legacy_batch` for coarse legacy links. |
+| `validation_state` | str | Reserved validation state: `unverified`, `confirmed`, or `disputed`. |
+
+Normal search and list operations return active revisions. History, provenance,
+recovery, and privacy-erasure operations can read all revision states.
+
+`delete_memory` retracts a memory and preserves its content and artifacts.
+Only the explicit privacy-erasure path physically deletes a lineage.
 
 ### Adding a new MCP tool
 

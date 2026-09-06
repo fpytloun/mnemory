@@ -11,6 +11,7 @@ from mnemory.migration import (
     META_COLLECTION,
     AddSparseVectorsMigration,
     BackfillOwnerIdMigration,
+    ClassifyLegacyFailedSessionsMigration,
     Migration,
     MigrationRunner,
     get_migrations,
@@ -42,6 +43,32 @@ class FailingMigration(Migration):
 
     def run(self, client, *, progress, state_callback, state):
         raise RuntimeError("Migration failed")
+
+
+def test_legacy_failed_session_migration_is_classification_only() -> None:
+    migration = ClassifyLegacyFailedSessionsMigration()
+    client = MagicMock()
+    point = MagicMock()
+    point.id = "session-1"
+    client.scroll.side_effect = [([point], None)]
+    state = {}
+
+    migration.run(
+        client,
+        progress=None,
+        state_callback=MagicMock(),
+        state=state,
+    )
+
+    payload = client.set_payload.call_args.kwargs["payload"]
+    assert payload == {
+        "failure_schema_version": 1,
+        "legacy_failure": True,
+        "failure_class": "legacy_unknown",
+    }
+    assert "consolidation_state" not in payload
+    assert "attempt_count" not in payload
+    assert client.set_payload.call_args.kwargs["points"] == ["session-1"]
 
 
 def _mock_client(existing_collections=None, state_payload=None):

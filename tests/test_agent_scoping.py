@@ -163,6 +163,48 @@ class TestVerifyMemoryAccess:
         service = self._make_service(get_by_id_return=mem)
         service.verify_memory_access("mem-1", session_agent_id="openwebui")
 
+    def test_other_tenant_owner_is_blocked(self):
+        mem = {
+            "id": "mem-1",
+            "user_id": "subject",
+            "owner_id": "other-owner",
+            "agent_id": "openwebui",
+        }
+        service = self._make_service(get_by_id_return=mem)
+        with pytest.raises(ValueError, match="Cannot access memory"):
+            service.verify_memory_access(
+                "mem-1",
+                user_id="subject",
+                owner_id="authenticated-owner",
+                session_agent_id="openwebui",
+            )
+
+    def test_legacy_record_without_owner_fails_closed(self):
+        mem = {"id": "mem-1", "user_id": "subject", "agent_id": "openwebui"}
+        service = self._make_service(get_by_id_return=mem)
+        with pytest.raises(ValueError, match="Cannot access memory"):
+            service.verify_memory_access(
+                "mem-1",
+                user_id="subject",
+                owner_id="authenticated-owner",
+                session_agent_id="openwebui",
+            )
+
+    def test_other_subject_user_is_blocked(self):
+        mem = {
+            "id": "mem-1",
+            "user_id": "other-subject",
+            "owner_id": "authenticated-owner",
+        }
+        service = self._make_service(get_by_id_return=mem)
+        with pytest.raises(ValueError, match="Cannot access memory"):
+            service.verify_memory_access(
+                "mem-1",
+                user_id="subject",
+                owner_id="authenticated-owner",
+                session_agent_id=None,
+            )
+
 
 # ── Dual-scope search ─────────────────────────────────────────────────
 

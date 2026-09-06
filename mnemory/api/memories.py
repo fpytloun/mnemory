@@ -10,7 +10,7 @@ import json
 import logging
 from dataclasses import asdict
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import Response
 
 from mnemory.api.deps import SessionContext, get_session_context
@@ -28,6 +28,8 @@ from mnemory.api.schemas import (
     GetMemoriesByIdsRequest,
     GetMemoriesByIdsResponse,
     ListMemoriesResponse,
+    MemoryHistoryResponse,
+    MemoryLinksResponse,
     RecentMemoriesResponse,
     SaveArtifactRequest,
     SearchMemoriesRequest,
@@ -35,6 +37,14 @@ from mnemory.api.schemas import (
     UpdateMemoryRequest,
     format_memory_item,
 )
+from mnemory.api.ui_projections import (
+    decode_cursor,
+    encode_cursor,
+    project_history,
+    project_links,
+    project_memory_item,
+)
+from mnemory.revisions import RevisionConflictError
 
 logger = logging.getLogger("mnemory")
 
@@ -55,6 +65,38 @@ def _record(operation: str, ctx: SessionContext) -> None:
     collector = get_collector()
     if collector:
         collector.record_operation(operation, ctx.user_id, ctx.agent_id)
+
+
+def _resolve_revision_precondition(
+    *, if_match: str | None, legacy_revision: int | None
+) -> int | None:
+    """Resolve one native integer revision from REST precondition inputs."""
+    header_revision: int | None = None
+    if if_match is not None:
+        token = if_match.strip()
+        if token.startswith('"') and token.endswith('"') and len(token) >= 2:
+            token = token[1:-1]
+        if (
+            not token
+            or not token.isascii()
+            or not token.isdigit()
+            or token.startswith("0")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail='If-Match must be a positive integer revision, for example "3"',
+            )
+        header_revision = int(token)
+    if (
+        header_revision is not None
+        and legacy_revision is not None
+        and header_revision != legacy_revision
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="If-Match and expected_revision must identify the same revision",
+        )
+    return header_revision if header_revision is not None else legacy_revision
 
 
 # ── Memory CRUD ───────────────────────────────────────────────────────
@@ -164,8 +206,12 @@ def delete_memories_batch(
 
     for mid in req.memory_ids:
         try:
-            service.verify_memory_access(mid, session_agent_id=ctx.agent_id)
-            result = service.delete_memory(memory_id=mid, user_id=ctx.user_id)
+            result = service.delete_memory(
+                memory_id=mid,
+                user_id=ctx.user_id,
+                owner_id=ctx.owner_id,
+                session_agent_id=ctx.agent_id,
+            )
             results.append(result)
         except ValueError as e:
             errors.append({"memory_id": mid, "error": True, "message": str(e)})
@@ -440,6 +486,83 @@ def list_memories(
     return ListMemoriesResponse(results=items)
 
 
+@router.get("/browse", response_model=ListMemoriesResponse)
+def browse_memories(
+    cursor: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    memory_type: str | None = Query(None),
+    categories: str | None = Query(None),
+    role: str | None = Query(None),
+    labels: str | None = Query(None),
+    memory_layer: str | None = Query(None),
+    agent_id: str | None = Query(None),
+    has_artifacts: bool = Query(False),
+    decayed_only: bool = Query(False),
+    include_decayed: bool = Query(False),
+    ctx: SessionContext = Depends(get_session_context),
+):
+    """Browse every authorized active memory with a stable opaque cursor."""
+    if memory_layer and memory_layer not in ("raw", "consolidated"):
+        raise HTTPException(status_code=422, detail="Invalid memory layer")
+    cat_list = (
+        [value.strip() for value in categories.split(",")] if categories else None
+    )
+    try:
+        labels_dict = json.loads(labels) if labels else None
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=422, detail="Invalid labels filter") from None
+    if labels_dict is not None and not isinstance(labels_dict, dict):
+        raise HTTPException(status_code=422, detail="Invalid labels filter")
+    binding = {
+        "user_id": ctx.user_id,
+        "owner_id": ctx.owner_id,
+        "session_agent_id": ctx.agent_id,
+        "memory_type": memory_type,
+        "categories": cat_list,
+        "role": role,
+        "labels": labels_dict,
+        "memory_layer": memory_layer,
+        "agent_id": agent_id,
+        "has_artifacts": has_artifacts,
+        "decayed_only": decayed_only,
+        "include_decayed": include_decayed,
+    }
+    try:
+        offset = decode_cursor(cursor, binding) if cursor else None
+        if memory_type:
+            from mnemory.memory import validate_memory_type
+
+            memory_type = validate_memory_type(memory_type)
+        if role and role not in ("user", "assistant"):
+            raise ValueError("Invalid role")
+        result = _get_service().vector.browse_active(
+            user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+            cursor=offset,
+            limit=limit,
+            memory_type=memory_type,
+            categories=cat_list,
+            role=role,
+            labels_filter=labels_dict,
+            memory_layer=memory_layer,
+            agent_id=agent_id,
+            has_artifacts=has_artifacts,
+            decayed_only=decayed_only,
+            include_decayed=include_decayed,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    next_offset = result.get("next_offset")
+    next_cursor = encode_cursor(next_offset, binding) if next_offset else None
+    items = [project_memory_item(item) for item in result["results"]]
+    return ListMemoriesResponse(
+        results=items,
+        next_cursor=next_cursor,
+        has_more=next_cursor is not None,
+    )
+
+
 @router.post("/by-ids", response_model=GetMemoriesByIdsResponse)
 def get_memories_by_ids(
     req: GetMemoriesByIdsRequest,
@@ -454,7 +577,12 @@ def get_memories_by_ids(
     """
     _record("get_memories_by_ids", ctx)
     service = _get_service()
-    results = service.get_memories_by_ids(req.ids, user_id=ctx.user_id)
+    results = service.get_memories_by_ids(
+        req.ids,
+        user_id=ctx.user_id,
+        owner_id=ctx.owner_id,
+        session_agent_id=ctx.agent_id,
+    )
     items = [format_memory_item(r) for r in results]
     return GetMemoriesByIdsResponse(results=items)
 
@@ -463,26 +591,32 @@ def get_memories_by_ids(
 def update_memory(
     memory_id: str,
     req: UpdateMemoryRequest,
+    if_match: str | None = Header(None, alias="If-Match"),
     ctx: SessionContext = Depends(get_session_context),
 ):
     """Update an existing memory's content or metadata."""
     _record("update_memory", ctx)
     service = _get_service()
+    expected_revision = _resolve_revision_precondition(
+        if_match=if_match, legacy_revision=req.expected_revision
+    )
     try:
-        # Verify ownership: must be own agent's memory or shared
-        service.verify_memory_access(memory_id, session_agent_id=ctx.agent_id)
         kwargs: dict = {
             "memory_id": memory_id,
             "user_id": ctx.user_id,
+            "owner_id": ctx.owner_id,
+            "session_agent_id": ctx.agent_id,
             "content": req.content,
             "memory_type": req.memory_type,
             "categories": req.categories,
             "importance": req.importance,
             "pinned": req.pinned,
+            "expected_revision": expected_revision,
+            "idempotency_key": req.idempotency_key,
         }
-        if req.ttl_days is not None:
+        if "ttl_days" in req.model_fields_set:
             kwargs["ttl_days"] = req.ttl_days
-        if req.event_date is not None:
+        if "event_date" in req.model_fields_set:
             kwargs["event_date"] = req.event_date
         if req.labels is not None:
             kwargs["labels"] = req.labels
@@ -505,6 +639,8 @@ def update_memory(
                         )
                 kwargs["agent_id"] = req.agent_id
         result = service.update_memory(**kwargs)
+    except RevisionConflictError as e:
+        raise HTTPException(status_code=409, detail=e.to_dict())
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -518,18 +654,28 @@ def update_memory(
 @router.delete("/{memory_id}")
 def delete_memory(
     memory_id: str,
+    expected_revision: int | None = Query(None, ge=1),
+    idempotency_key: str | None = Query(None, min_length=1, max_length=256),
+    if_match: str | None = Header(None, alias="If-Match"),
     ctx: SessionContext = Depends(get_session_context),
 ):
-    """Delete a memory and its artifacts."""
+    """Retract a memory while preserving its revision history and artifacts."""
     _record("delete_memory", ctx)
     service = _get_service()
+    resolved_revision = _resolve_revision_precondition(
+        if_match=if_match, legacy_revision=expected_revision
+    )
     try:
-        # Verify ownership: must be own agent's memory or shared
-        service.verify_memory_access(memory_id, session_agent_id=ctx.agent_id)
         result = service.delete_memory(
             memory_id=memory_id,
             user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+            expected_revision=resolved_revision,
+            idempotency_key=idempotency_key,
         )
+    except RevisionConflictError as e:
+        raise HTTPException(status_code=409, detail=e.to_dict())
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -540,6 +686,107 @@ def delete_memory(
     return result
 
 
+@router.delete("/{memory_id}/privacy")
+def privacy_erase_memory(
+    memory_id: str,
+    ctx: SessionContext = Depends(get_session_context),
+):
+    """Physically erase one memory lineage and its unreferenced artifacts."""
+    _record("privacy_erase_memory", ctx)
+    service = _get_service()
+    try:
+        return service.privacy_erase_memory(
+            memory_id,
+            user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get("/{memory_id}/history", response_model=MemoryHistoryResponse)
+def get_memory_history(
+    memory_id: str,
+    revision_cursor: str | None = Query(None),
+    operation_cursor: str | None = Query(None),
+    limit: int = Query(50, ge=1, le=100),
+    ctx: SessionContext = Depends(get_session_context),
+):
+    """Return immutable revisions and audited operations for one lineage."""
+    _record("get_memory_history", ctx)
+    service = _get_service()
+    try:
+        binding = {
+            "user_id": ctx.user_id,
+            "owner_id": ctx.owner_id,
+            "session_agent_id": ctx.agent_id,
+            "memory_id": memory_id,
+        }
+        revision_before = (
+            int(decode_cursor(revision_cursor, {**binding, "kind": "revision"}))
+            if revision_cursor
+            else None
+        )
+        operation_before = (
+            decode_cursor(operation_cursor, {**binding, "kind": "operation"})
+            if operation_cursor
+            else None
+        )
+        raw = service.get_memory_history_page(
+            memory_id,
+            user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+            revision_before=revision_before,
+            operation_before=operation_before,
+            limit=limit,
+        )
+        projected = project_history(raw, limit=limit)
+        if raw.get("next_revision_before") is not None:
+            projected.next_revision_cursor = encode_cursor(
+                str(raw["next_revision_before"]),
+                {**binding, "kind": "revision"},
+            )
+        if raw.get("next_operation_before"):
+            projected.next_operation_cursor = encode_cursor(
+                raw["next_operation_before"],
+                {**binding, "kind": "operation"},
+            )
+        return projected
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
+@router.get("/{memory_id}/links", response_model=MemoryLinksResponse)
+def get_memory_links(
+    memory_id: str,
+    ctx: SessionContext = Depends(get_session_context),
+):
+    """Return exact supersession and derivation links for one revision."""
+    _record("get_memory_links", ctx)
+    service = _get_service()
+    try:
+        links = service.get_memory_links(
+            memory_id,
+            user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+        )
+        for field in ("supersedes", "successor"):
+            link_id = links.get(field)
+            links[field] = service.vector.get_by_id(link_id) if link_id else None
+        for field in ("derived_from", "derived_outputs"):
+            links[field] = [
+                item
+                for link_id in links.get(field, [])
+                if (item := service.vector.get_by_id(link_id)) is not None
+            ]
+        return project_links(links)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 # ── Artifacts ─────────────────────────────────────────────────────────
 
 
@@ -547,11 +794,15 @@ def delete_memory(
 def save_artifact(
     memory_id: str,
     req: SaveArtifactRequest,
+    if_match: str | None = Header(None, alias="If-Match"),
     ctx: SessionContext = Depends(get_session_context),
 ):
     """Attach an artifact to a memory."""
     _record("save_artifact", ctx)
     service = _get_service()
+    expected_revision = _resolve_revision_precondition(
+        if_match=if_match, legacy_revision=None
+    )
     try:
         result = service.save_artifact(
             memory_id=memory_id,
@@ -559,7 +810,12 @@ def save_artifact(
             content=req.content,
             filename=req.filename,
             content_type=req.content_type,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+            expected_revision=expected_revision,
         )
+    except RevisionConflictError as e:
+        raise HTTPException(status_code=409, detail=e.to_dict())
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -582,6 +838,8 @@ def list_artifacts(
         result = service.list_artifacts(
             memory_id=memory_id,
             user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -604,6 +862,8 @@ def get_artifact(
             memory_id=memory_id,
             artifact_id=artifact_id,
             user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
             offset=offset,
             limit=limit,
         )
@@ -646,7 +906,12 @@ def create_download_token(
     service = _get_service()
 
     # Verify artifact exists and user has access.
-    artifacts = service.list_artifacts(memory_id, user_id=ctx.user_id)
+    artifacts = service.list_artifacts(
+        memory_id,
+        user_id=ctx.user_id,
+        owner_id=ctx.owner_id,
+        session_agent_id=ctx.agent_id,
+    )
     if not any(a["id"] == artifact_id for a in artifacts):
         raise HTTPException(status_code=404, detail="Artifact not found")
 
@@ -662,6 +927,8 @@ def create_download_token(
         memory_id=memory_id,
         artifact_id=artifact_id,
         ttl_seconds=ttl_seconds,
+        owner_id=ctx.owner_id,
+        agent_id=ctx.agent_id,
     )
 
     path = f"/api/memories/{memory_id}/artifacts/{artifact_id}/raw?token={token}"
@@ -702,6 +969,8 @@ def get_artifact_raw(
             memory_id=memory_id,
             artifact_id=artifact_id,
             user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -734,17 +1003,26 @@ def get_artifact_raw(
 def delete_artifact(
     memory_id: str,
     artifact_id: str,
+    if_match: str | None = Header(None, alias="If-Match"),
     ctx: SessionContext = Depends(get_session_context),
 ):
     """Delete an artifact from a memory."""
     _record("delete_artifact", ctx)
     service = _get_service()
+    expected_revision = _resolve_revision_precondition(
+        if_match=if_match, legacy_revision=None
+    )
     try:
         result = service.delete_artifact(
             memory_id=memory_id,
             artifact_id=artifact_id,
             user_id=ctx.user_id,
+            owner_id=ctx.owner_id,
+            session_agent_id=ctx.agent_id,
+            expected_revision=expected_revision,
         )
+    except RevisionConflictError as e:
+        raise HTTPException(status_code=409, detail=e.to_dict())
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

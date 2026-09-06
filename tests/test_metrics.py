@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 from mnemory.metrics import MetricsCollector
@@ -16,6 +17,8 @@ def _make_collector(*, ttl: int = 600) -> MetricsCollector:
     config.vector.is_remote = False
     config.artifact.backend = "filesystem"
     config.memory.fsck_auto_interval = 0
+    config.memory.fsck_stranded_after_seconds = 3600
+    config.memory.legacy_failed_retry_max_raw_memories = 100
     vector = MagicMock()
     vector.collection_name = "mnemory"
     vector._client.scroll.return_value = ([], None)
@@ -36,7 +39,7 @@ def test_refresh_request_uses_exact_payload_and_page_size() -> None:
 
     collector._refresh_gauges_from_qdrant()
 
-    kwargs = collector._vector_store._client.scroll.call_args.kwargs
+    kwargs = collector._vector_store._client.scroll.call_args_list[0].kwargs
     assert kwargs["limit"] == 2048
     assert kwargs["with_vectors"] is False
     assert kwargs["with_payload"] == [
@@ -45,11 +48,148 @@ def test_refresh_request_uses_exact_payload_and_page_size() -> None:
         "memory_type",
         "role",
         "memory_layer",
-        "decayed_at",
+        "expires_at",
         "pinned",
         "artifacts",
         "categories",
+        "revision_state",
     ]
+
+
+def test_expiration_metric_counts_only_current_non_pinned_expiry() -> None:
+    collector = _make_collector()
+    now = datetime.now(timezone.utc)
+
+    def point(expires_at: str | None, *, pinned: bool = False) -> MagicMock:
+        value = MagicMock()
+        value.payload = {
+            "user_id": "user-1",
+            "expires_at": expires_at,
+            "pinned": pinned,
+        }
+        return value
+
+    collector._vector_store._client.scroll.return_value = (
+        [
+            point((now - timedelta(days=1)).isoformat()),
+            point((now - timedelta(days=1)).isoformat(), pinned=True),
+            point((now + timedelta(days=1)).isoformat()),
+            point("invalid"),
+            point(None),
+        ],
+        None,
+    )
+
+    collector._refresh_gauges_from_qdrant()
+
+    assert (
+        collector._memories_decayed.labels(user_id="user-1", agent_id="")._value.get()
+        == 1
+    )
+
+
+def test_memory_gauges_exclude_historical_revision_states() -> None:
+    collector = _make_collector()
+
+    def point(state: str | None) -> MagicMock:
+        value = MagicMock()
+        value.payload = {
+            "user_id": "user-1",
+            "memory_type": "fact",
+            "role": "user",
+            "memory_layer": "raw",
+            "pinned": True,
+            "artifacts": [{"id": "artifact-1"}],
+            "categories": ["personal"],
+        }
+        if state is not None:
+            value.payload["revision_state"] = state
+        return value
+
+    collector._vector_store._client.scroll.return_value = (
+        [
+            point(None),
+            point("active"),
+            point("superseded"),
+            point("source"),
+            point("retracted"),
+            point("pending"),
+        ],
+        None,
+    )
+
+    collector._refresh_gauges_from_qdrant()
+
+    assert (
+        sum(
+            metric._value.get()
+            for metric in collector._memories_total._metrics.values()
+        )
+        == 2
+    )
+    assert (
+        sum(
+            metric._value.get()
+            for metric in collector._memories_pinned._metrics.values()
+        )
+        == 2
+    )
+    assert (
+        sum(
+            metric._value.get()
+            for metric in collector._memories_with_artifacts._metrics.values()
+        )
+        == 2
+    )
+
+
+def test_recovery_gauges_use_configured_thresholds() -> None:
+    collector = _make_collector()
+    collector._config.memory.fsck_stranded_after_seconds = 10
+    collector._config.memory.legacy_failed_retry_max_raw_memories = 1
+    operation = MagicMock()
+    operation.payload = {
+        "status": "applying",
+        "updated_at_utc": (
+            datetime.now(timezone.utc) - timedelta(seconds=20)
+        ).isoformat(),
+    }
+    session = MagicMock()
+    session.payload = {
+        "legacy_failure": True,
+        "failure_class": "legacy_unknown",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "memory_ids": ["memory-1", "memory-2"],
+        "session_revision": 1,
+    }
+    collector._vector_store._client.collection_exists.return_value = True
+    collector._vector_store._client.scroll.side_effect = [
+        ([], None),
+        ([operation], None),
+        ([session], None),
+    ]
+
+    collector._refresh_gauges_from_qdrant()
+
+    assert collector._fsck_operations_nonterminal._value.get() == 1
+    assert (
+        sum(
+            metric._value.get()
+            for metric in collector._fsck_operations_stranded._metrics.values()
+        )
+        == 1
+    )
+    assert collector._failed_sessions_eligible._value.get() == 0
+
+
+def test_fsck_recovery_metric_uses_bounded_outcomes() -> None:
+    collector = _make_collector()
+
+    collector.record_fsck_recovery("committed")
+    collector.record_fsck_recovery("unbounded-value")
+
+    assert collector._fsck_recovery.labels(outcome="committed")._value.get() == 1
+    assert collector._fsck_recovery.labels(outcome="failed")._value.get() == 1
 
 
 def test_stale_callers_submit_one_refresh_without_waiting() -> None:

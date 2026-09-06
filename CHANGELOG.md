@@ -1,6 +1,25 @@
 # Changelog
 
-## [Unreleased]
+## [1.13.0] — 2026-09-06
+
+### Added
+
+- **Immutable memory revisions** — Semantic updates create successor points in the existing Qdrant memory collection.
+- **Provenance and audit** — Added exact derivation links, history APIs, and the `_mnemory_operations` audit collection.
+- **Stale-write protection** — Update and retraction APIs accept expected revisions and lineage-scoped idempotency keys.
+- **Evidence confirmation** — Inferred deduplication can confirm an active revision from new independent user evidence.
+- **Optional slow decay** — Disabled-by-default gradual ranking decay uses access and validation timestamps.
+- **Recoverable fsck journal** — Fsck operations retain deterministic checkpoints and terminal failure or skip outcomes.
+- **Legacy failure controls** — Added content-free diagnostics and default-disabled bounded retry controls.
+
+### Changed
+
+- **Delete semantics** — Ordinary deletion now creates a retraction tombstone and preserves history. Explicit privacy deletion erases the full lineage.
+- **Consolidation evidence** — Consolidation records sources per output and retains raw evidence instead of physically deleting it.
+- **Migration 005** — Startup backfills revision metadata without changing existing IDs, text, vectors, or legacy payload fields.
+- **Migration 006** — Startup adds validation indexes and neutral legacy validation projections without changing content or vectors.
+- **Recall reinforcement** — Access timestamps and TTL refresh now apply only after final result delivery.
+- **Migration 007** — Failed sessions without diagnostics are classified as legacy metadata without retrying them.
 
 ## [1.12.2] — 2026-08-23
 

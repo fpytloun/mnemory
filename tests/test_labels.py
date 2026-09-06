@@ -73,6 +73,16 @@ def _make_service(auto_classify=False, track_access=False):
         service = MemoryService(mock_config)
 
     service.vector = MagicMock()
+    service.revisions = MagicMock()
+    service.revisions.revise.return_value = {
+        "operation_id": "op-1",
+        "lineage_id": "mem-1",
+        "previous_revision_id": "mem-1",
+        "revision_id": "mem-2",
+        "revision": 2,
+        "status": "updated",
+        "replayed": False,
+    }
     service._llm = MagicMock()
     service._find_llm = service._llm
 
@@ -455,11 +465,8 @@ class TestLabelsUpdateMerge:
             labels={"source": "new", "env": "prod"},
         )
 
-        # Check update_metadata was called with merged labels
-        service.vector.update_metadata.assert_called_once()
-        # update_metadata is called as update_metadata(target_id, metadata_dict)
-        call_args = service.vector.update_metadata.call_args
-        meta_arg = call_args[0][1]  # positional arg [1]
+        service.revisions.revise.assert_called_once()
+        meta_arg = service.revisions.revise.call_args.kwargs["changes"]
         assert meta_arg["labels"] == {
             "source": "new",  # caller wins
             "project": "cars",  # preserved from existing
@@ -519,8 +526,7 @@ class TestLabelsUpdateMerge:
             # No labels passed
         )
 
-        call_args = service.vector.update_metadata.call_args
-        meta_arg = call_args[0][1]
+        meta_arg = service.revisions.revise.call_args.kwargs["changes"]
         assert meta_arg["labels"] == {"source": "old"}
 
 
@@ -540,9 +546,8 @@ class TestLabelsUpdateMemory:
             labels={"project": "myapp"},
         )
 
-        service.vector.update_metadata.assert_called_once()
-        call_args = service.vector.update_metadata.call_args
-        meta_arg = call_args[0][1]
+        service.revisions.revise.assert_called_once()
+        meta_arg = service.revisions.revise.call_args.kwargs["changes"]
         assert meta_arg["labels"] == {"project": "myapp"}
 
     def test_update_empty_dict_clears_labels(self):
@@ -553,8 +558,7 @@ class TestLabelsUpdateMemory:
             labels={},
         )
 
-        call_args = service.vector.update_metadata.call_args
-        meta_arg = call_args[0][1]
+        meta_arg = service.revisions.revise.call_args.kwargs["changes"]
         assert meta_arg["labels"] == {}
 
     def test_update_none_preserves_labels(self):
@@ -568,8 +572,7 @@ class TestLabelsUpdateMemory:
             # labels=None (default) — should not appear in metadata_updates
         )
 
-        call_args = service.vector.update_metadata.call_args
-        meta_arg = call_args[0][1]
+        meta_arg = service.revisions.revise.call_args.kwargs["changes"]
         assert "labels" not in meta_arg
 
     def test_update_validates_labels(self):

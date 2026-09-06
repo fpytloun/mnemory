@@ -16,6 +16,7 @@ from mnemory.tokens import (
     derive_signing_key,
     generate_download_token,
     validate_download_token,
+    validate_download_token_claims,
 )
 
 # ── derive_signing_key ────────────────────────────────────────────────
@@ -120,6 +121,29 @@ class TestValidateDownloadToken:
         )
         uid = validate_download_token(signing_key, token, "mem-1", "art-1")
         assert uid == "user1"
+
+    def test_scoped_claims_preserve_owner_and_agent(self, signing_key):
+        token = generate_download_token(
+            signing_key,
+            "user1",
+            "mem-1",
+            "art-1",
+            owner_id="owner-1",
+            agent_id="parent:alpha",
+        )
+
+        claims = validate_download_token_claims(
+            signing_key,
+            token,
+            "mem-1",
+            "art-1",
+        )
+
+        assert claims == {
+            "u": "user1",
+            "o": "owner-1",
+            "g": "parent:alpha",
+        }
 
     def test_expired_token(self, signing_key):
         token = generate_download_token(

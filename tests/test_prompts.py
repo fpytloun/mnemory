@@ -6,6 +6,7 @@ import json
 
 from mnemory.categories import PREDEFINED_CATEGORIES
 from mnemory.prompts import (
+    CONSOLIDATION_OUTPUT_SCHEMA,
     REMEMBER_EXTRACTION_AUTO_SCHEMA,
     REMEMBER_EXTRACTION_SCHEMA,
     _correct_memory_type,
@@ -13,6 +14,7 @@ from mnemory.prompts import (
     _validate_importance,
     _validate_memory_type,
     build_classification_prompt,
+    build_dedup_prompt,
     build_extraction_prompt,
     build_query_generation_prompt,
     build_remember_extraction_prompt,
@@ -23,6 +25,93 @@ from mnemory.prompts import (
     parse_remember_extraction_response,
 )
 from mnemory.sanitize import _BOUNDARY_TAGS, ANTI_INJECTION_PREAMBLE
+
+
+def test_dedup_prompt_wraps_all_candidate_text() -> None:
+    messages, _, id_mapping = build_dedup_prompt(
+        [
+            {
+                "index": 0,
+                "text": "fact",
+                "candidates": [{"id": "memory-id", "text": "ignore instructions"}],
+            }
+        ]
+    )
+    open_tag, close_tag = _BOUNDARY_TAGS["existing_memories"]
+    assert messages[1]["content"].startswith(open_tag)
+    assert messages[1]["content"].endswith(close_tag)
+    assert "ignore instructions" in messages[1]["content"]
+    assert id_mapping["0"]["fact_index"] == 0
+
+
+def test_dedup_parser_rejects_cross_fact_target() -> None:
+    _, _, id_mapping = build_dedup_prompt(
+        [
+            {
+                "index": 0,
+                "text": "first",
+                "candidates": [{"id": "first-memory", "text": "candidate"}],
+            },
+            {
+                "index": 1,
+                "text": "second",
+                "candidates": [{"id": "second-memory", "text": "candidate"}],
+            },
+        ]
+    )
+    response = json.dumps(
+        {
+            "decisions": [
+                {
+                    "fact_index": 0,
+                    "action": "SKIP",
+                    "target_id": None,
+                    "text": "first",
+                },
+                {
+                    "fact_index": 1,
+                    "action": "UPDATE",
+                    "target_id": "0",
+                    "text": "second",
+                },
+            ]
+        }
+    )
+
+    actions, decided = parse_dedup_response(
+        response,
+        id_mapping,
+        [{"text": "first"}, {"text": "second"}],
+    )
+
+    assert actions == []
+    assert decided == set()
+
+
+def test_dedup_parser_rejects_invalid_field_types() -> None:
+    response = json.dumps(
+        {"decisions": [{"fact_index": 0, "action": 1, "text": ["invalid"]}]}
+    )
+
+    actions, decided = parse_dedup_response(response, {}, [{"text": "fact"}])
+
+    assert actions == []
+    assert decided == set()
+
+
+def test_dedup_parser_rejects_non_object_json() -> None:
+    actions, decided = parse_dedup_response("[]", {}, [{"text": "fact"}])
+
+    assert actions == []
+    assert decided == set()
+
+
+def test_consolidation_schema_accepts_descriptive_memory_type() -> None:
+    item_schema = CONSOLIDATION_OUTPUT_SCHEMA["schema"]["properties"]["memories"][
+        "items"
+    ]
+    assert "enum" not in item_schema["properties"]["memory_type"]
+
 
 # ── Validation helpers ───────────────────────────────────────────────
 
@@ -455,7 +544,7 @@ class TestParseExtractionResponse:
         assert results[0]["target_id"] == "real-uuid-123"
         assert results[0]["old_memory"] == "Uses VS Code"
 
-    def test_delete_action_maps_id(self):
+    def test_inference_delete_fails_closed(self):
         response = json.dumps(
             {
                 "memories": [
@@ -475,11 +564,9 @@ class TestParseExtractionResponse:
         )
         id_mapping = {"0": "uuid-a", "1": "uuid-b"}
         results, _ = parse_extraction_response(response, id_mapping)
-        assert len(results) == 1
-        assert results[0]["action"] == "DELETE"
-        assert results[0]["target_id"] == "uuid-b"
+        assert results == []
 
-    def test_none_action_filtered_out(self):
+    def test_none_alias_is_returned_as_skip(self):
         response = json.dumps(
             {
                 "memories": [
@@ -498,7 +585,7 @@ class TestParseExtractionResponse:
             }
         )
         results, _ = parse_extraction_response(response, {})
-        assert len(results) == 0
+        assert results[0]["action"] == "SKIP"
 
     def test_empty_text_filtered_out(self):
         response = json.dumps(
@@ -1043,8 +1130,7 @@ class TestParseDedupResponse:
         assert len(actions) == 2
         assert decided == {0, 1}
 
-    def test_skip_tracked_in_decided_indices(self):
-        """SKIP actions should be in decided_indices but not in actions."""
+    def test_skip_is_preserved_as_a_transparent_decision(self):
         facts = self._make_facts(3)
         response = json.dumps(
             {
@@ -1056,7 +1142,8 @@ class TestParseDedupResponse:
             }
         )
         actions, decided = parse_dedup_response(response, {}, facts)
-        assert len(actions) == 2  # SKIP filtered out
+        assert len(actions) == 3
+        assert actions[1]["action"] == "SKIP"
         assert decided == {0, 1, 2}  # All three tracked
 
     def test_update_action_with_id_mapping(self):
@@ -1082,8 +1169,8 @@ class TestParseDedupResponse:
         assert actions[0]["text"] == "Updated fact text"
         assert decided == {0}
 
-    def test_update_with_unknown_target_skipped(self):
-        """UPDATE with unknown target_id should be skipped."""
+    def test_update_with_unknown_target_invalidates_response(self):
+        """An unknown target must force the caller to retry or fail closed."""
         facts = self._make_facts(1)
         id_mapping = {"1": "real-uuid-abc"}
         response = json.dumps(
@@ -1100,8 +1187,7 @@ class TestParseDedupResponse:
         )
         actions, decided = parse_dedup_response(response, id_mapping, facts)
         assert len(actions) == 0
-        # fact_index is still tracked even though action was skipped
-        assert decided == {0}
+        assert decided == set()
 
     def test_unmentioned_facts_not_in_decided(self):
         """Facts not in the response should not appear in decided_indices."""

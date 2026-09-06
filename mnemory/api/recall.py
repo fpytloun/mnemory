@@ -70,6 +70,7 @@ def _search_with_scope(
             owner_id=ctx.owner_id,
             session_agent_id=ctx.agent_id,
             labels=labels,
+            track_access=False,
         )
     return service.search_memories(
         query=query,
@@ -77,6 +78,7 @@ def _search_with_scope(
         owner_id=ctx.owner_id,
         agent_id=None,
         labels=labels,
+        track_access=False,
     )
 
 
@@ -134,6 +136,7 @@ def recall(
 
     stats = RecallStats()
     response = RecallResponse(session_id=session.session_id)
+    delivered_ids: set[str] = set()
 
     # Build instructions if requested
     if req.include_instructions:
@@ -171,6 +174,7 @@ def recall(
                 owner_id=ctx.owner_id,
                 agent_id=ctx.agent_id,
                 recent_days=req.recent_days,
+                track_access=False,
             )
             if core_result.text:
                 response.core_memories = core_result.text
@@ -181,6 +185,7 @@ def recall(
                 # Add core memory IDs to known_ids so search results
                 # don't duplicate memories already in core context
                 if core_result.memory_ids:
+                    delivered_ids.update(core_result.memory_ids)
                     session_store.add_known_ids(
                         session.session_id, core_result.memory_ids
                     )
@@ -208,6 +213,7 @@ def recall(
                     session_timezone=ctx.timezone,
                     context=req.context,
                     labels=labels,
+                    track_access=False,
                 )
                 search_results = result.get("results", [])
             except Exception:
@@ -255,9 +261,11 @@ def recall(
             session_store.add_known_ids(session.session_id, new_ids)
 
         response.search_results = [format_memory_item(r) for r in new_results]
+        delivered_ids.update(new_ids)
 
     elapsed_ms = int((time.monotonic() - start_time) * 1000)
     stats.latency_ms = elapsed_ms
     response.stats = stats
+    service.track_delivered_memory_ids(delivered_ids)
 
     return response

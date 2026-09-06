@@ -7,6 +7,7 @@ at query time, not via background jobs.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
@@ -156,3 +157,78 @@ def build_reinforcement_metadata(memory: dict) -> dict:
             updates["decayed_at"] = None
 
     return updates
+
+
+def apply_validation_and_decay_score(memory: dict, config: MemoryConfig) -> float:
+    """Return a score with bounded validation boost and optional slow decay."""
+    metadata = memory.get("metadata") or {}
+    score = float(memory.get("score", 0.0))
+    configured_roots = getattr(config, "validation_max_score_roots", 3)
+    max_roots = max(configured_roots if isinstance(configured_roots, int) else 3, 1)
+    validation_count = max(int(metadata.get("validation_count") or 0), 0)
+    validation_strength = min(validation_count, max_roots) / max_roots
+    validation_enabled = getattr(config, "validation_enabled", False) is True
+    configured_boost = getattr(config, "validation_max_score_boost", 0.10)
+    boost = configured_boost if isinstance(configured_boost, (int, float)) else 0.10
+    if validation_enabled:
+        score *= 1.0 + max(boost, 0.0) * validation_strength
+
+    if getattr(config, "slow_decay_enabled", False) is not True or metadata.get(
+        "pinned", False
+    ):
+        return score
+
+    anchors = [
+        metadata.get("revision_created_at_utc"),
+        metadata.get("created_at_utc"),
+        memory.get("created_at"),
+        metadata.get("last_accessed_at"),
+        metadata.get("last_validated_at"),
+    ]
+    parsed: list[datetime] = []
+    for value in anchors:
+        if not value:
+            continue
+        try:
+            timestamp = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        parsed.append(timestamp)
+    if not parsed:
+        return score
+
+    age_days = max((datetime.now(timezone.utc) - max(parsed)).total_seconds(), 0.0)
+    age_days /= 86400.0
+    configured_half_life = getattr(config, "slow_decay_half_life_days", 30.0)
+    base_half_life = max(
+        float(configured_half_life)
+        if isinstance(configured_half_life, (int, float))
+        else 30.0,
+        0.001,
+    )
+    configured_multiplier = getattr(
+        config, "slow_decay_validation_half_life_multiplier", 2.0
+    )
+    validation_multiplier = max(
+        float(configured_multiplier)
+        if isinstance(configured_multiplier, (int, float))
+        else 2.0,
+        1.0,
+    )
+    half_life = base_half_life * (
+        1.0 + (validation_multiplier - 1.0) * validation_strength
+    )
+    configured_floor = getattr(config, "slow_decay_score_floor", 0.25)
+    floor = min(
+        max(
+            float(configured_floor)
+            if isinstance(configured_floor, (int, float))
+            else 0.25,
+            0.0,
+        ),
+        1.0,
+    )
+    decay_factor = max(floor, math.pow(2.0, -age_days / half_life))
+    return score * decay_factor

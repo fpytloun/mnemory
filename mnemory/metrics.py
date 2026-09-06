@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from typing import Any
 
 from prometheus_client import (
@@ -155,7 +156,7 @@ class MetricsCollector:
         )
         self._memories_decayed = Gauge(
             "mnemory_memories_decayed_total",
-            "Total decayed (expired) memories",
+            "Total currently expired, non-pinned memories",
             ["user_id", "agent_id"],
             registry=self._registry,
         )
@@ -209,6 +210,70 @@ class MetricsCollector:
             ["user_id"],
             registry=self._registry,
         )
+        self._fsck_operation_outcomes = Counter(
+            "mnemory_fsck_operation_outcomes_total",
+            "Fsck operation journal outcomes",
+            ["outcome"],
+            registry=self._registry,
+        )
+        self._fsck_recovery = Counter(
+            "mnemory_fsck_recovery_total",
+            "Fsck operation recovery outcomes",
+            ["outcome"],
+            registry=self._registry,
+        )
+        self._fsck_operations_nonterminal = Gauge(
+            "mnemory_fsck_operations_nonterminal",
+            "Current nonterminal fsck operation count",
+            registry=self._registry,
+        )
+        self._fsck_operations_stranded = Gauge(
+            "mnemory_fsck_operations_stranded",
+            "Current stranded fsck operations by bounded age bucket",
+            ["age_bucket"],
+            registry=self._registry,
+        )
+        self._session_retry_batches = Counter(
+            "mnemory_session_retry_batches_total",
+            "Bounded failed-session retry batch outcomes",
+            ["outcome"],
+            registry=self._registry,
+        )
+        self._session_retry_sessions = Counter(
+            "mnemory_session_retry_sessions_total",
+            "Failed-session retry outcomes",
+            ["outcome"],
+            registry=self._registry,
+        )
+        self._session_retry_stops = Counter(
+            "mnemory_session_retry_stops_total",
+            "Failed-session retry stop reasons",
+            ["reason"],
+            registry=self._registry,
+        )
+        self._failed_sessions = Gauge(
+            "mnemory_failed_sessions",
+            "Current failed sessions by bounded classification",
+            ["legacy", "failure_class"],
+            registry=self._registry,
+        )
+        self._failed_sessions_age = Gauge(
+            "mnemory_failed_sessions_age",
+            "Current failed sessions by age bucket",
+            ["age_bucket"],
+            registry=self._registry,
+        )
+        self._failed_sessions_size = Gauge(
+            "mnemory_failed_sessions_size",
+            "Current failed sessions by raw-memory count bucket",
+            ["size_bucket"],
+            registry=self._registry,
+        )
+        self._failed_sessions_eligible = Gauge(
+            "mnemory_failed_sessions_eligible",
+            "Current legacy failed sessions eligible for bounded retry",
+            registry=self._registry,
+        )
 
         # ── Remember quality counters (in-memory) ─────────────────
         self._remember_extracted = Counter(
@@ -233,6 +298,18 @@ class MetricsCollector:
             "mnemory_remember_empty_extractions_total",
             "Remember calls that produced zero extracted facts",
             ["user_id"],
+            registry=self._registry,
+        )
+        self._confirmations = Counter(
+            "mnemory_confirmations_total",
+            "Independent-evidence confirmation outcomes",
+            ["outcome"],
+            registry=self._registry,
+        )
+        self._evidence_requests = Counter(
+            "mnemory_evidence_requests_total",
+            "Synchronous trusted evidence request outcomes",
+            ["outcome", "reason"],
             registry=self._registry,
         )
 
@@ -456,6 +533,67 @@ class MetricsCollector:
                 self._remember_dedup_decisions.labels(
                     user_id=user_id, action=action.lower()
                 ).inc(count)
+
+    def record_confirmation(self, outcome: str) -> None:
+        """Record a bounded-cardinality confirmation outcome."""
+        if outcome not in {"accepted", "replayed", "rejected", "recovered"}:
+            outcome = "rejected"
+        self._confirmations.labels(outcome=outcome).inc()
+
+    def record_fsck_operation(self, outcome: str) -> None:
+        """Record one bounded fsck journal outcome."""
+        if outcome not in {"committed", "skipped", "failed", "superseded"}:
+            outcome = "failed"
+        self._fsck_operation_outcomes.labels(outcome=outcome).inc()
+
+    def record_fsck_recovery(self, outcome: str) -> None:
+        """Record one bounded fsck recovery outcome."""
+        if outcome not in {"committed", "skipped", "failed", "superseded"}:
+            outcome = "failed"
+        self._fsck_recovery.labels(outcome=outcome).inc()
+
+    def record_session_retry(
+        self,
+        *,
+        batch_outcome: str,
+        succeeded: int,
+        failed: int,
+        stop_reason: str | None,
+    ) -> None:
+        """Record bounded failed-session retry outcomes."""
+        self._session_retry_batches.labels(outcome=batch_outcome).inc()
+        if succeeded:
+            self._session_retry_sessions.labels(outcome="succeeded").inc(succeeded)
+        if failed:
+            self._session_retry_sessions.labels(outcome="failed").inc(failed)
+        if stop_reason:
+            self._session_retry_stops.labels(reason=stop_reason).inc()
+
+    def record_evidence(self, outcome: str, reason: str = "none") -> None:
+        """Record a bounded-cardinality trusted evidence outcome."""
+        allowed_outcomes = {
+            "accepted",
+            "replayed",
+            "recovered",
+            "rejected",
+            "skipped",
+        }
+        allowed_reasons = {
+            "none",
+            "auth",
+            "schema",
+            "claim_active",
+            "lease_lost",
+            "stale_target",
+            "recovery",
+            "conflict",
+            "timeout",
+            "server_error",
+        }
+        self._evidence_requests.labels(
+            outcome=outcome if outcome in allowed_outcomes else "rejected",
+            reason=reason if reason in allowed_reasons else "server_error",
+        ).inc()
 
     def record_consolidation_run(
         self,
@@ -874,10 +1012,11 @@ class MetricsCollector:
             "memory_type",
             "role",
             "memory_layer",
-            "decayed_at",
+            "expires_at",
             "pinned",
             "artifacts",
             "categories",
+            "revision_state",
         ]
 
         while True:
@@ -892,6 +1031,8 @@ class MetricsCollector:
 
             for point in points:
                 payload = point.payload or {}
+                if payload.get("revision_state", "active") != "active":
+                    continue
                 user_id = payload.get("user_id", "unknown")
                 agent_id = payload.get("agent_id", "") or ""
                 memory_type = payload.get("memory_type", "unknown")
@@ -901,9 +1042,17 @@ class MetricsCollector:
                 # Total by dimensions
                 total[(user_id, agent_id, memory_type, role)] += 1
 
-                # Decayed
-                if payload.get("decayed_at"):
-                    decayed[(user_id, agent_id)] += 1
+                # Preserve the metric series name, but count actual expiry.
+                expires_at = payload.get("expires_at")
+                if expires_at and not payload.get("pinned"):
+                    try:
+                        expires_dt = datetime.fromisoformat(expires_at)
+                        if expires_dt.tzinfo is None:
+                            expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+                        if expires_dt < datetime.now(timezone.utc):
+                            decayed[(user_id, agent_id)] += 1
+                    except (TypeError, ValueError):
+                        logger.debug("Ignoring invalid expires_at value %r", expires_at)
 
                 # Pinned
                 if payload.get("pinned"):
@@ -925,6 +1074,134 @@ class MetricsCollector:
                 break
             offset = next_offset
 
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        nonterminal = 0
+        stranded = defaultdict(int)
+        now = datetime.now(timezone.utc)
+        stranded_after = self._config.memory.fsck_stranded_after_seconds
+        retry_max_memories = self._config.memory.legacy_failed_retry_max_raw_memories
+        if client.collection_exists("_mnemory_operations"):
+            offset = None
+            while True:
+                points, next_offset = client.scroll(
+                    collection_name="_mnemory_operations",
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="operation_kind", match=MatchValue(value="fsck")
+                            )
+                        ]
+                    ),
+                    limit=512,
+                    offset=offset,
+                    with_payload=["status", "created_at_utc", "updated_at_utc"],
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    if payload.get("status") not in {"planned", "applying", "failed"}:
+                        continue
+                    nonterminal += 1
+                    value = payload.get("updated_at_utc") or payload.get(
+                        "created_at_utc"
+                    )
+                    try:
+                        age = (now - datetime.fromisoformat(str(value))).total_seconds()
+                    except (TypeError, ValueError):
+                        age = 0
+                    if age < stranded_after:
+                        continue
+                    bucket = (
+                        "lt_1h"
+                        if age < 3600
+                        else "1h_24h"
+                        if age < 86400
+                        else "24h_7d"
+                        if age < 604800
+                        else "gt_7d"
+                    )
+                    stranded[bucket] += 1
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+        failed_classes = defaultdict(int)
+        failed_ages = defaultdict(int)
+        failed_sizes = defaultdict(int)
+        failed_eligible = 0
+        if client.collection_exists("_mnemory_sessions"):
+            offset = None
+            while True:
+                points, next_offset = client.scroll(
+                    collection_name="_mnemory_sessions",
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="consolidation_state",
+                                match=MatchValue(value="failed"),
+                            )
+                        ]
+                    ),
+                    limit=512,
+                    offset=offset,
+                    with_payload=[
+                        "legacy_failure",
+                        "failure_class",
+                        "last_error_at",
+                        "updated_at",
+                        "memory_ids",
+                        "session_revision",
+                        "consolidation_token",
+                        "consolidation_plan",
+                    ],
+                    with_vectors=False,
+                )
+                for point in points:
+                    payload = point.payload or {}
+                    legacy = bool(payload.get("legacy_failure"))
+                    failure_class = payload.get("failure_class") or "unknown"
+                    failed_classes[(str(legacy).lower(), failure_class)] += 1
+                    value = payload.get("last_error_at") or payload.get("updated_at")
+                    try:
+                        age_days = (now - datetime.fromisoformat(str(value))).days
+                    except (TypeError, ValueError):
+                        age_days = -1
+                    age_bucket = (
+                        "unknown"
+                        if age_days < 0
+                        else "lt_7d"
+                        if age_days < 7
+                        else "7d_30d"
+                        if age_days < 30
+                        else "30d_90d"
+                        if age_days < 90
+                        else "gt_90d"
+                    )
+                    failed_ages[age_bucket] += 1
+                    count = len(payload.get("memory_ids") or [])
+                    size_bucket = (
+                        "1_5"
+                        if count <= 5
+                        else "6_20"
+                        if count <= 20
+                        else "21_100"
+                        if count <= 100
+                        else "gt_100"
+                    )
+                    failed_sizes[size_bucket] += 1
+                    if (
+                        legacy
+                        and 0 < count <= retry_max_memories
+                        and payload.get("session_revision") is not None
+                        and not payload.get("consolidation_token")
+                        and not payload.get("consolidation_plan")
+                    ):
+                        failed_eligible += 1
+                if next_offset is None:
+                    break
+                offset = next_offset
+
         with self._exposition_lock:
             # Clear and replace all Qdrant-backed labels as one snapshot.
             self._memories_total._metrics.clear()
@@ -933,6 +1210,22 @@ class MetricsCollector:
             self._memories_by_category._metrics.clear()
             self._memories_by_layer._metrics.clear()
             self._memories_with_artifacts._metrics.clear()
+            self._fsck_operations_nonterminal.set(nonterminal)
+            self._fsck_operations_stranded._metrics.clear()
+            for bucket, count in stranded.items():
+                self._fsck_operations_stranded.labels(age_bucket=bucket).set(count)
+            self._failed_sessions._metrics.clear()
+            for (legacy, failure_class), count in failed_classes.items():
+                self._failed_sessions.labels(
+                    legacy=legacy, failure_class=failure_class
+                ).set(count)
+            self._failed_sessions_age._metrics.clear()
+            for bucket, count in failed_ages.items():
+                self._failed_sessions_age.labels(age_bucket=bucket).set(count)
+            self._failed_sessions_size._metrics.clear()
+            for bucket, count in failed_sizes.items():
+                self._failed_sessions_size.labels(size_bucket=bucket).set(count)
+            self._failed_sessions_eligible.set(failed_eligible)
 
             for (uid, aid, mtype, role), count in total.items():
                 self._memories_total.labels(

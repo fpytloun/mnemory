@@ -86,11 +86,18 @@ const MnemoryAPI = {
 
     if (!response.ok) {
       let msg = `HTTP ${response.status}`;
+      let detail = null;
       try {
         const body = await response.json();
-        msg = body.detail || body.message || body.error || msg;
+        detail = body.detail || null;
+        msg = typeof detail === 'string'
+          ? detail
+          : (detail?.message || body.message || body.error || msg);
       } catch { /* ignore parse errors */ }
-      throw new Error(msg);
+      const error = new Error(msg);
+      error.status = response.status;
+      error.detail = detail;
+      throw error;
     }
 
     // Handle empty responses (204 No Content)
@@ -124,16 +131,17 @@ const MnemoryAPI = {
   },
 
   /** PUT request */
-  async put(path, body = {}) {
+  async put(path, body = {}, headers = {}) {
     return this._fetch(path, {
       method: 'PUT',
       body: JSON.stringify(body),
+      headers,
     });
   },
 
   /** DELETE request */
-  async del(path) {
-    return this._fetch(path, { method: 'DELETE' });
+  async del(path, headers = {}) {
+    return this._fetch(path, { method: 'DELETE', headers });
   },
 
   // ── Convenience methods ──────────────────────────────────────
@@ -179,16 +187,34 @@ const MnemoryAPI = {
     return this.get('/memories', params);
   },
 
+  browseMemories(params = {}) {
+    return this.get('/memories/browse', params);
+  },
+
   getMemoriesByIds(ids) {
     return this.post('/memories/by-ids', { ids });
   },
 
-  updateMemory(id, data) {
-    return this.put(`/memories/${id}`, data);
+  updateMemory(id, data, revision = null) {
+    const headers = revision ? { 'If-Match': `"${revision}"` } : {};
+    return this.put(`/memories/${id}`, data, headers);
   },
 
-  deleteMemory(id) {
-    return this.del(`/memories/${id}`);
+  deleteMemory(id, revision = null) {
+    const headers = revision ? { 'If-Match': `"${revision}"` } : {};
+    return this.del(`/memories/${id}`, headers);
+  },
+
+  privacyEraseMemory(id) {
+    return this.del(`/memories/${id}/privacy`);
+  },
+
+  getMemoryHistory(id, params = {}) {
+    return this.get(`/memories/${id}/history`, params);
+  },
+
+  getMemoryLinks(id) {
+    return this.get(`/memories/${id}/links`);
   },
 
   addMemory(data) {
@@ -219,12 +245,18 @@ const MnemoryAPI = {
     return result.url;
   },
 
-  saveArtifact(memoryId, data) {
-    return this.post(`/memories/${memoryId}/artifacts`, data);
+  saveArtifact(memoryId, data, revision = null) {
+    const headers = revision ? { 'If-Match': `"${revision}"` } : {};
+    return this._fetch(`/memories/${memoryId}/artifacts`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+      headers,
+    });
   },
 
-  deleteArtifact(memoryId, artifactId) {
-    return this.del(`/memories/${memoryId}/artifacts/${artifactId}`);
+  deleteArtifact(memoryId, artifactId, revision = null) {
+    const headers = revision ? { 'If-Match': `"${revision}"` } : {};
+    return this.del(`/memories/${memoryId}/artifacts/${artifactId}`, headers);
   },
 
   // ── Fsck (Memory Check) ───────────────────────────────────────

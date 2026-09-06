@@ -21,6 +21,8 @@ class SessionContext:
     agent_id: str | None = None
     owner_id: str | None = None
     timezone: str | None = None
+    auth_kind: str | None = None
+    trusted_evidence: bool = False
 
 
 def get_session_context() -> SessionContext:
@@ -43,8 +45,10 @@ def get_session_context() -> SessionContext:
     """
     from mnemory.server import (
         _session_agent_id,
+        _session_auth_kind,
         _session_owner_id,
         _session_timezone,
+        _session_trusted_evidence,
         _session_user_id,
     )
 
@@ -61,4 +65,6 @@ def get_session_context() -> SessionContext:
         agent_id=_session_agent_id.get(),
         owner_id=_session_owner_id.get() or user_id,
         timezone=_session_timezone.get(),
+        auth_kind=_session_auth_kind.get(),
+        trusted_evidence=_session_trusted_evidence.get(),
     )

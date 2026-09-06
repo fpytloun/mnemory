@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
+
+from mnemory.revisions import RevisionService, canonical_fingerprint
 
 if TYPE_CHECKING:
     from mnemory.config import Config
@@ -35,6 +39,26 @@ _MAX_OUTPUT_SIMILARITY = 0.90
 # Minimum content length for a consolidated memory
 _MIN_CONTENT_LENGTH = 20
 
+_CONSOLIDATION_TYPE_ALIASES = {
+    "goal": "episodic",
+    "decision": "episodic",
+    "action": "episodic",
+    "workflow": "procedural",
+}
+_VALID_MEMORY_TYPES = {"preference", "fact", "episodic", "procedural", "context"}
+
+
+def _normalize_consolidation_memory_type(value: Any) -> str:
+    """Normalize descriptive provider labels to supported storage types."""
+    if not isinstance(value, str):
+        return "episodic"
+    normalized = value.strip().lower()
+    if normalized in _VALID_MEMORY_TYPES:
+        return normalized
+    result = _CONSOLIDATION_TYPE_ALIASES.get(normalized, "episodic")
+    logger.info("Normalized consolidation memory_type %r to %r", value, result)
+    return result
+
 
 @dataclass
 class ConsolidationResult:
@@ -47,6 +71,96 @@ class ConsolidationResult:
     state: str = "idle"  # idle, consolidating, consolidated, failed
     error: str | None = None
     duration_seconds: float = 0.0
+
+
+RETRY_INPUT_REASON_CODES = (
+    "linked_memory_lookup_failed",
+    "linked_memory_missing",
+    "linked_memory_user_mismatch",
+    "linked_memory_owner_mismatch",
+    "linked_memory_agent_mismatch",
+    "linked_memory_not_raw",
+    "linked_memory_not_active",
+    "linked_memory_superseded",
+)
+
+
+@dataclass(frozen=True)
+class RetryInputAssessment:
+    """Immutable assessment of one session's linked raw-memory inputs."""
+
+    input_fingerprint: str
+    reasons: tuple[str, ...]
+    memory_count: int
+
+
+def assess_retry_inputs(
+    vector: VectorStore,
+    session: dict[str, Any],
+    *,
+    user_id: str,
+    owner_id: str,
+    agent_id: str | None,
+) -> RetryInputAssessment:
+    """Validate every linked memory revision for an explicit retry."""
+    memory_ids = list(
+        dict.fromkeys(str(item) for item in session.get("memory_ids") or [])
+    )
+    try:
+        memories = vector.get_by_ids_strict(memory_ids)
+    except Exception:
+        return RetryInputAssessment(
+            input_fingerprint=canonical_fingerprint(
+                {"memory_ids": memory_ids, "state": "lookup_failed"}
+            ),
+            reasons=("linked_memory_lookup_failed",),
+            memory_count=len(memory_ids),
+        )
+
+    by_id = {str(memory["id"]): memory for memory in memories}
+    reasons: list[str] = []
+    snapshots: list[dict[str, Any]] = []
+    for memory_id in memory_ids:
+        memory = by_id.get(memory_id)
+        if memory is None:
+            reasons.append("linked_memory_missing")
+            snapshots.append({"memory_id": memory_id, "state": "missing"})
+            continue
+        metadata = memory.get("metadata") or {}
+        if memory.get("user_id") != user_id:
+            reasons.append("linked_memory_user_mismatch")
+        if (memory.get("owner_id") or memory.get("user_id")) != owner_id:
+            reasons.append("linked_memory_owner_mismatch")
+        if memory.get("agent_id") != agent_id:
+            reasons.append("linked_memory_agent_mismatch")
+        if metadata.get("memory_layer", "raw") != "raw":
+            reasons.append("linked_memory_not_raw")
+        if metadata.get("revision_state", "active") != "active":
+            reasons.append("linked_memory_not_active")
+        if metadata.get("superseded_by"):
+            reasons.append("linked_memory_superseded")
+        snapshots.append(
+            {
+                "memory_id": memory_id,
+                "user_id": memory.get("user_id"),
+                "owner_id": memory.get("owner_id") or memory.get("user_id"),
+                "agent_id": memory.get("agent_id"),
+                "memory_layer": metadata.get("memory_layer", "raw"),
+                "lineage_id": metadata.get("lineage_id", memory_id),
+                "revision": metadata.get("revision", 1),
+                "revision_state": metadata.get("revision_state", "active"),
+                "superseded_by": metadata.get("superseded_by"),
+                "content_hash": memory.get("hash"),
+            }
+        )
+    ordered_reasons = tuple(
+        reason for reason in RETRY_INPUT_REASON_CODES if reason in set(reasons)
+    )
+    return RetryInputAssessment(
+        input_fingerprint=canonical_fingerprint(snapshots),
+        reasons=ordered_reasons,
+        memory_count=len(memory_ids),
+    )
 
 
 class ConsolidationService:
@@ -90,7 +204,13 @@ class ConsolidationService:
             idle_threshold_seconds=self._config.memory.consolidation_idle_threshold,
         )
 
-    def consolidate_session(self, session_id: str) -> ConsolidationResult:
+    def consolidate_session(
+        self,
+        session_id: str,
+        *,
+        session_record: dict[str, Any] | None = None,
+        mutation_guard: Callable[[], None] | None = None,
+    ) -> ConsolidationResult:
         """Consolidate one session's raw memories into durable knowledge.
 
         State machine: idle -> consolidating -> consolidated (or failed).
@@ -100,16 +220,22 @@ class ConsolidationService:
         result = ConsolidationResult(session_id=session_id)
         t0 = time.monotonic()
 
+        def guard_mutation() -> None:
+            if mutation_guard is not None:
+                mutation_guard()
+
         try:
             # 1. Read session summary
-            session = self._sessions.get(session_id)
+            session = session_record or self._sessions.get(session_id)
             if session is None:
                 result.error = "Session not found"
                 result.state = "failed"
                 return result
 
             user_id = session.get("user_id", "")
+            owner_id = session.get("owner_id") or user_id
             agent_id = session.get("agent_id")
+            session_point_id = session.get("_point_id")
             memory_ids = session.get("memory_ids", [])
             summary = session.get("summary", "")
 
@@ -120,25 +246,52 @@ class ConsolidationService:
                 len(summary),
             )
 
-            if not memory_ids:
-                logger.debug("Session %s has no memories, skipping", session_id)
-                result.state = "consolidated"
-                self._sessions.update_consolidation_state(session_id, "consolidated")
+            # 2. Claim the exact session generation before model work.
+            session_revision = int(session.get("session_revision", 1))
+            if "session_revision" not in session:
+                guard_mutation()
+                self._sessions._client.set_payload(
+                    collection_name=self._sessions.COLLECTION,
+                    payload={"session_revision": session_revision},
+                    points=[
+                        session_point_id or self._sessions.get_point_id(session_id)
+                    ],
+                    wait=True,
+                )
+            consolidation_token = str(uuid.uuid4())
+            guard_mutation()
+            if not self._sessions.claim_consolidation(
+                session_id,
+                expected_revision=session_revision,
+                token=consolidation_token,
+                attempt_count=int(session.get("attempt_count", 0)) + 1,
+                point_id=session_point_id,
+            ):
+                result.error = "Session revision changed or is already claimed"
+                result.state = "failed"
                 return result
-
-            # 2. Set state to consolidating
-            self._sessions.update_consolidation_state(session_id, "consolidating")
             result.state = "consolidating"
 
             # 3. Fetch linked raw memories
-            raw_memories = self._fetch_raw_memories(memory_ids, user_id)
+            raw_memories = self._fetch_raw_memories(
+                memory_ids,
+                user_id,
+                owner_id,
+                agent_id,
+            )
             if not raw_memories:
                 logger.info(
                     "Session %s: no raw memories found (may already be consolidated)",
                     session_id,
                 )
-                self._sessions.update_consolidation_state(session_id, "consolidated")
-                result.state = "consolidated"
+                guard_mutation()
+                result.state = self._sessions.finalize_consolidation(
+                    session_id,
+                    expected_revision=session_revision,
+                    token=consolidation_token,
+                    consolidated_memory_ids=session.get("consolidated_memory_ids", []),
+                    point_id=session_point_id,
+                )
                 return result
 
             # 3b. Fetch previously consolidated memories (for re-consolidation)
@@ -148,7 +301,16 @@ class ConsolidationService:
                 for prev_id in prev_consolidated_ids:
                     try:
                         mem = self._vector.get_by_id(prev_id)
-                        if mem and mem.get("memory"):
+                        if (
+                            mem
+                            and mem.get("memory")
+                            and self._in_session_scope(
+                                mem,
+                                user_id=user_id,
+                                owner_id=owner_id,
+                                agent_id=agent_id,
+                            )
+                        ):
                             previous_consolidated.append(mem)
                     except Exception:
                         pass
@@ -279,8 +441,14 @@ class ConsolidationService:
                     "Consolidation session %s: no facts produced",
                     session_id,
                 )
-                self._sessions.update_consolidation_state(session_id, "consolidated")
-                result.state = "consolidated"
+                guard_mutation()
+                result.state = self._sessions.finalize_consolidation(
+                    session_id,
+                    expected_revision=session_revision,
+                    token=consolidation_token,
+                    consolidated_memory_ids=session.get("consolidated_memory_ids", []),
+                    point_id=session_point_id,
+                )
                 return result
 
             # 6. Validate output quality (warn but proceed — don't block)
@@ -294,17 +462,66 @@ class ConsolidationService:
                     validation_warning,
                 )
 
-            # 7. Store consolidated memories (per-batch derived_from)
+            # 7. Persist the deterministic plan before the first output write.
+            guard_mutation()
+            operation_id = self._memory.revisions.operations.write(
+                consolidation_token,
+                {
+                    "status": "planned",
+                    "operation_kind": "consolidation",
+                    "actor_kind": "consolidation",
+                    "user_id": user_id,
+                    "owner_id": owner_id,
+                    "agent_id": agent_id,
+                    "session_id": session_id,
+                    "session_revision": session_revision,
+                    "lineage_id": f"session:{session_id}",
+                },
+            )
+            output_index = 0
+            plan: list[dict[str, Any]] = []
+            for batch_facts, _ in all_raw_ids_map:
+                for fact in batch_facts:
+                    fact = dict(fact)
+                    fact["memory_id"] = str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            (
+                                f"mnemory:consolidation:{consolidation_token}:"
+                                f"{output_index}"
+                            ),
+                        )
+                    )
+                    fact["operation_id"] = operation_id
+                    fact["source_session_id"] = session_id
+                    plan.append(fact)
+                    output_index += 1
+            guard_mutation()
+            self._sessions.update_consolidation_state(
+                session_id,
+                "consolidating",
+                consolidation_token=consolidation_token,
+                consolidation_plan=plan,
+                point_id=session_point_id,
+            )
+            guard_mutation()
+            self._memory.revisions.operations.write(
+                consolidation_token,
+                {"status": "planned", "plan": plan},
+            )
+
+            # 8. Store every output with its exact sources.
             all_stored_ids: list[str] = []
-            for batch_facts, batch_raw_ids in all_raw_ids_map:
-                batch_stored = self._store_consolidated(
-                    batch_facts,
+            all_stored_ids.extend(
+                self._store_consolidated(
+                    plan,
                     user_id=user_id,
+                    owner_id=owner_id,
                     agent_id=agent_id,
-                    derived_from=batch_raw_ids,
                     raw_memories=raw_memories,
+                    mutation_guard=mutation_guard,
                 )
-                all_stored_ids.extend(batch_stored)
+            )
 
             result.memories_produced = len(all_stored_ids)
             result.consolidated_memory_ids = all_stored_ids
@@ -315,46 +532,65 @@ class ConsolidationService:
                 len(all_stored_ids),
             )
 
-            # 8. Write consolidated_memory_ids to session (append to existing)
+            # 9. Write consolidated_memory_ids to session (append to existing)
             # Append-only: previous consolidated memories are kept intact.
             # New IDs are added alongside old ones.
             merged_consolidated_ids = list(prev_consolidated_ids) + all_stored_ids
+            guard_mutation()
             self._sessions.update_consolidation_state(
                 session_id,
                 "consolidating",  # still consolidating until supersede done
                 consolidated_memory_ids=merged_consolidated_ids,
+                point_id=session_point_id,
             )
 
-            # 9. Mark raw memories as superseded (except artifact-bearing)
-            superseded_count = 0
-            first_stored = all_stored_ids[0] if all_stored_ids else None
-            for mem in raw_memories:
-                mem_id = mem["id"]
-                if mem_id in artifact_ids:
-                    logger.debug(
-                        "Skipping supersede for artifact-bearing memory %s",
-                        mem_id,
-                    )
-                    continue
-                try:
-                    self._vector.update_metadata(
-                        mem_id,
-                        {"superseded_by": first_stored},
-                    )
-                    superseded_count += 1
-                except Exception:
-                    logger.warning(
-                        "Failed to supersede memory %s", mem_id, exc_info=True
-                    )
-            result.memories_superseded = superseded_count
+            # 10. Retain exact referenced raw revisions as derivation sources.
+            source_ids = list(
+                dict.fromkeys(
+                    source_id
+                    for fact in plan
+                    for source_id in fact.get("derived_from", [])
+                )
+            )
+            guard_mutation()
+            self._memory.revisions.mark_source(
+                source_ids,
+                operation_id=operation_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=agent_id,
+                mutation_guard=mutation_guard,
+            )
+            result.memories_superseded = len(source_ids)
+            guard_mutation()
+            self._memory.revisions.operations.write(
+                consolidation_token,
+                {
+                    "status": "sources_marked",
+                    "result_revision_ids": all_stored_ids,
+                    "source_revision_ids": source_ids,
+                },
+            )
 
-            # 10. Set final state (with merged IDs)
-            self._sessions.update_consolidation_state(
+            # 11. Set final state (with merged IDs)
+            guard_mutation()
+            final_state = self._sessions.finalize_consolidation(
                 session_id,
-                "consolidated",
+                expected_revision=session_revision,
+                token=consolidation_token,
                 consolidated_memory_ids=merged_consolidated_ids,
+                point_id=session_point_id,
             )
-            result.state = "consolidated"
+            guard_mutation()
+            self._memory.revisions.operations.write(
+                consolidation_token,
+                {
+                    "status": "committed",
+                    "result_revision_ids": all_stored_ids,
+                    "source_revision_ids": source_ids,
+                },
+            )
+            result.state = final_state
 
             reconsolidation = bool(prev_consolidated_ids)
             logger.info(
@@ -363,15 +599,36 @@ class ConsolidationService:
                 "re-consolidated" if reconsolidation else "consolidated",
                 len(raw_memories),
                 len(all_stored_ids),
-                superseded_count,
+                len(source_ids),
             )
 
-        except Exception:
+        except Exception as exc:
             logger.exception("Consolidation failed for session %s", session_id)
             result.error = "Unexpected error during consolidation"
             result.state = "failed"
             try:
-                self._sessions.update_consolidation_state(session_id, "failed")
+                persisted = (
+                    self._sessions.get(
+                        session_id,
+                        point_id=(
+                            session.get("_point_id")
+                            if "session" in locals() and session
+                            else None
+                        ),
+                    )
+                    or {}
+                )
+                if persisted.get("consolidation_plan"):
+                    result.state = "consolidating"
+                else:
+                    guard_mutation()
+                    self._sessions.update_consolidation_state(
+                        session_id,
+                        "failed",
+                        error_code=type(exc).__name__,
+                        consolidation_token=None,
+                        point_id=persisted.get("_point_id"),
+                    )
             except Exception:
                 pass
 
@@ -413,7 +670,12 @@ class ConsolidationService:
             logger.exception("Recovery failed for user %s", user_id)
         return recovered
 
-    def recover_session(self, session: dict[str, Any]) -> bool:
+    def recover_session(
+        self,
+        session: dict[str, Any],
+        *,
+        mutation_guard: Callable[[], None] | None = None,
+    ) -> bool:
         """Recover one consolidating session.
 
         Returns True when existing consolidation output completed recovery.
@@ -421,37 +683,115 @@ class ConsolidationService:
         """
         sid = session.get("session_id", "")
         user_id = session.get("user_id", "")
+        plan = session.get("consolidation_plan")
+        token = session.get("consolidation_token")
+
+        def guard_mutation() -> None:
+            if mutation_guard is not None:
+                mutation_guard()
+
+        if isinstance(plan, list) and token:
+            logger.info("Recovering session %s from durable consolidation plan", sid)
+            owner_id = session.get("owner_id") or user_id
+            raw_memories = self._fetch_raw_memories(
+                session.get("memory_ids", []),
+                user_id,
+                owner_id,
+                session.get("agent_id"),
+            )
+            stored_ids = self._store_consolidated(
+                plan,
+                user_id=user_id,
+                owner_id=owner_id,
+                agent_id=session.get("agent_id"),
+                raw_memories=raw_memories,
+                mutation_guard=mutation_guard,
+            )
+            source_ids = list(
+                dict.fromkeys(
+                    source_id
+                    for fact in plan
+                    for source_id in fact.get("derived_from", [])
+                )
+            )
+            operation = self._memory.revisions.operations.get(token)
+            operation_id = (
+                operation.get("operation_id")
+                if operation
+                else self._memory.revisions.operations.write(
+                    token,
+                    {
+                        "status": "recovering",
+                        "operation_kind": "consolidation",
+                        "actor_kind": "consolidation",
+                        "user_id": user_id,
+                        "owner_id": owner_id,
+                        "session_id": sid,
+                        "lineage_id": f"session:{sid}",
+                        "plan": plan,
+                    },
+                )
+            )
+            guard_mutation()
+            self._memory.revisions.mark_source(
+                source_ids,
+                operation_id=operation_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                session_agent_id=session.get("agent_id"),
+                mutation_guard=mutation_guard,
+            )
+            previous_ids = session.get("consolidated_memory_ids") or []
+            merged_ids = list(dict.fromkeys([*previous_ids, *stored_ids]))
+            guard_mutation()
+            self._sessions.finalize_consolidation(
+                sid,
+                expected_revision=int(session.get("session_revision", 1)),
+                token=token,
+                consolidated_memory_ids=merged_ids,
+                point_id=session.get("_point_id"),
+            )
+            guard_mutation()
+            self._memory.revisions.operations.write(
+                token,
+                {
+                    "status": "committed",
+                    "result_revision_ids": stored_ids,
+                    "source_revision_ids": source_ids,
+                },
+            )
+            return True
+
         consolidated_ids = session.get("consolidated_memory_ids")
         if consolidated_ids:
-            logger.info("Recovering session %s: resuming supersede", sid)
-            memory_ids = session.get("memory_ids", [])
-            raw_memories = self._fetch_raw_memories(memory_ids, user_id)
-            artifact_ids = {
-                memory["id"]
-                for memory in raw_memories
-                if (memory.get("metadata") or {}).get("artifacts")
-            }
-            for memory in raw_memories:
-                if memory["id"] not in artifact_ids:
-                    try:
-                        self._vector.update_metadata(
-                            memory["id"],
-                            {"superseded_by": consolidated_ids[0]},
-                        )
-                    except Exception:
-                        pass
+            logger.info("Recovering legacy session %s without exact source plan", sid)
+            guard_mutation()
             self._sessions.update_consolidation_state(
                 sid,
                 "consolidated",
                 consolidated_memory_ids=consolidated_ids,
+                point_id=session.get("_point_id"),
             )
             return True
 
         logger.info("Recovering session %s: resetting to idle", sid)
-        self._sessions.update_consolidation_state(sid, "idle")
+        guard_mutation()
+        self._sessions.update_consolidation_state(
+            sid,
+            "idle",
+            consolidation_token=None,
+            consolidation_plan=None,
+            point_id=session.get("_point_id"),
+        )
         return False
 
-    def _fetch_raw_memories(self, memory_ids: list[str], user_id: str) -> list[dict]:
+    def _fetch_raw_memories(
+        self,
+        memory_ids: list[str],
+        user_id: str,
+        owner_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[dict]:
         """Fetch raw memories by IDs, filtering to only unsuperseded raw."""
         # Deduplicate IDs (preserve order) — sessions may accumulate
         # duplicate IDs from the remember endpoint's dedup-update path.
@@ -468,6 +808,15 @@ class ConsolidationService:
                 if result is None:
                     not_found += 1
                     continue
+                if not self._in_session_scope(
+                    result,
+                    user_id=user_id,
+                    owner_id=owner_id or user_id,
+                    agent_id=agent_id,
+                ):
+                    fetch_errors += 1
+                    logger.warning("Memory %s is outside the session owner", mid)
+                    continue
                 meta = result.get("metadata") or {}
                 # Only include raw, unsuperseded memories
                 layer = meta.get("memory_layer", "raw")
@@ -475,6 +824,9 @@ class ConsolidationService:
                     skipped_layer += 1
                     continue
                 if meta.get("superseded_by"):
+                    skipped_superseded += 1
+                    continue
+                if meta.get("revision_state", "active") != "active":
                     skipped_superseded += 1
                     continue
                 memories.append(result)
@@ -497,6 +849,29 @@ class ConsolidationService:
                 len(memory_ids),
             )
         return memories
+
+    @staticmethod
+    def _in_session_scope(
+        memory: dict[str, Any],
+        *,
+        user_id: str,
+        owner_id: str,
+        agent_id: str | None,
+    ) -> bool:
+        """Check tenant and agent scope for session-linked memory IDs."""
+        if memory.get("user_id") != user_id or memory.get("owner_id") not in (
+            None,
+            owner_id,
+        ):
+            return False
+        memory_agent_id = memory.get("agent_id")
+        if agent_id is None:
+            return memory_agent_id is None
+        return (
+            memory_agent_id is None
+            or memory_agent_id == agent_id
+            or memory_agent_id.startswith(agent_id + ":")
+        )
 
     def _consolidate_role(
         self,
@@ -599,10 +974,52 @@ class ConsolidationService:
 
             batch_facts = parsed["memories"]
             batch_raw_ids = [m["id"] for m in batch]
+            source_aliases = {
+                f"S{index}": memory_id for index, memory_id in enumerate(batch_raw_ids)
+            }
 
-            # Set role on each fact (implicit from the call)
+            # Resolve exact source aliases before any durable write.
+            valid_facts: list[dict[str, Any]] = []
             for f in batch_facts:
+                aliases = f.get("source_ids")
+                if not batch and aliases is None:
+                    aliases = []
+                if not isinstance(aliases, list):
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: "
+                        "output omitted source_ids",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                    )
+                    continue
+                if batch and not aliases:
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: "
+                        "output has no raw source",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                    )
+                    continue
+                if any(alias not in source_aliases for alias in aliases):
+                    logger.warning(
+                        "Consolidation session %s [%s] batch %d: "
+                        "output referenced an unknown source alias",
+                        session_id,
+                        role,
+                        batch_idx + 1,
+                    )
+                    continue
+                f["derived_from"] = list(
+                    dict.fromkeys(source_aliases[alias] for alias in aliases)
+                )
                 f["role"] = role
+                f["memory_type"] = _normalize_consolidation_memory_type(
+                    f.get("memory_type")
+                )
+                valid_facts.append(f)
+            batch_facts = valid_facts
 
             logger.info(
                 "Consolidation session %s [%s] batch %d: produced %d facts",
@@ -659,9 +1076,10 @@ class ConsolidationService:
         facts: list[dict],
         *,
         user_id: str,
+        owner_id: str | None = None,
         agent_id: str | None,
-        derived_from: list[str],
         raw_memories: list[dict] | None = None,
+        mutation_guard: Callable[[], None] | None = None,
     ) -> list[str]:
         """Store consolidated memories via add_memory(infer=False).
 
@@ -694,9 +1112,39 @@ class ConsolidationService:
                 # categories if the LLM returned an empty list
                 categories = fact.get("categories") or fallback_categories
 
+                memory_id = fact["memory_id"]
+                revision_metadata = RevisionService.initial_metadata(
+                    memory_id,
+                    operation_id=fact["operation_id"],
+                    derived_from=fact.get("derived_from"),
+                    source_session_id=fact.get("source_session_id"),
+                )
+                consumed_roots: list[str] = []
+                for source_id in fact.get("derived_from") or []:
+                    source = self._memory.vector.get_by_id(source_id)
+                    source_meta = (source or {}).get("metadata") or {}
+                    consumed_roots.extend(source_meta.get("evidence_root_ids") or [])
+                    consumed_roots.extend(
+                        source_meta.get("consumed_evidence_root_ids") or []
+                    )
+                unique_consumed = list(dict.fromkeys(consumed_roots))
+                revision_metadata.update(
+                    {
+                        "source_kind": "consolidation",
+                        "validation_eligible": False,
+                        "evidence_root_ids": [],
+                        "consumed_evidence_root_ids": unique_consumed,
+                        "validation_count": 0,
+                        "validation_strength": 0.0,
+                        "validation_state": "unverified",
+                    }
+                )
+                if mutation_guard is not None:
+                    mutation_guard()
                 result = self._memory.add_memory(
                     text,
                     user_id=user_id,
+                    owner_id=owner_id or user_id,
                     agent_id=effective_agent_id,
                     infer=False,
                     _trusted=True,
@@ -706,23 +1154,15 @@ class ConsolidationService:
                     pinned=fact.get("pinned", False),
                     role=fact.get("role", "user"),
                     event_date=fact.get("event_date"),
+                    _memory_id=memory_id,
+                    _revision_metadata=revision_metadata,
+                    _mutation_guard=mutation_guard,
                 )
 
                 results = result.get("results", [])
                 if results:
                     mem_id = results[0].get("id", "")
                     if mem_id:
-                        # Set derived_from and memory_layer on the stored memory
-                        try:
-                            self._vector.update_metadata(
-                                mem_id,
-                                {
-                                    "derived_from": derived_from,
-                                    "memory_layer": "consolidated",
-                                },
-                            )
-                        except Exception:
-                            logger.debug("Failed to set derived_from on %s", mem_id)
                         stored_ids.append(mem_id)
             except Exception:
                 logger.warning(
@@ -731,4 +1171,5 @@ class ConsolidationService:
                     fact.get("role", "user"),
                     exc_info=True,
                 )
+                raise
         return stored_ids

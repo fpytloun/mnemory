@@ -3477,6 +3477,8 @@ DEDUP_SCHEMA: dict[str, Any] = {
 
 def build_dedup_prompt(
     facts_with_candidates: list[dict[str, Any]],
+    *,
+    trusted: bool = False,
 ) -> tuple[list[dict[str, str]], dict[str, Any], dict[str, str]]:
     """Build the Stage 2 dedup prompt.
 
@@ -3530,6 +3532,26 @@ def build_dedup_prompt(
     system_prompt = _DEDUP_SYSTEM_PROMPT.format(
         anti_injection=ANTI_INJECTION_PREAMBLE,
     )
+    if trusted:
+        start = system_prompt.index("**CRITICAL**:")
+        end = system_prompt.index("### Subject preservation")
+        system_prompt = (
+            system_prompt[:start]
+            + """**CRITICAL**: These facts were extracted from an authenticated user event.
+Use CONFIRM for full bidirectional semantic equivalence, including punctuation,
+paraphrases and translations. Never equate negation, changed quantities, dates,
+scope, or partial support of a multi-fact memory. Partial support is SKIP.
+Only UPDATE for an explicit supported change about the same subject.
+Ambiguity is SKIP. Return one decision for EVERY fact, including skipped facts.
+Journal code, not the model, determines whether the evidence root is independent.
+
+"""
+            + system_prompt[end:]
+        )
+        system_prompt = system_prompt.replace("prefer ADD.", "prefer SKIP.").replace(
+            "→ Decision: SKIP (already captured exactly)",
+            "→ Decision: CONFIRM (full semantic equivalence)",
+        )
 
     messages = [
         {"role": "system", "content": system_prompt},

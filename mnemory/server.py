@@ -2141,27 +2141,41 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
 
 class EvidenceAuthMiddleware(BaseHTTPMiddleware):
-    """Confine Cognis user-event JWTs to the synchronous evidence route."""
+    """Confine Cognis user-event JWTs to their matching routes."""
 
-    _PATH = "/api/evidence/remember/v1"
+    _EVIDENCE_PATH = "/api/evidence/remember/v1"
+    _USER_EVENT_PATH = "/api/user-events/remember/v1"
 
     async def dispatch(self, request: Request, call_next):
-        is_target = request.method == "POST" and request.url.path == self._PATH
+        route_scope = None
+        if request.method == "POST":
+            if request.url.path == self._EVIDENCE_PATH:
+                route_scope = "mnemory:evidence"
+            elif request.url.path == self._USER_EVENT_PATH:
+                route_scope = "mnemory:remember:user"
         authorization = request.headers.get("authorization", "")
         token = (
             authorization[7:].strip()
             if authorization.lower().startswith("bearer ")
             else ""
         )
+        bearer_token = bool(token)
+        if not token:
+            token = request.headers.get("x-api-key", "").strip()
         cookie_token = request.cookies.get("cognis_session", "").strip()
-        if not is_target and not token:
+        if route_scope is None and not token:
             token = cookie_token
         validator = None
         if token:
             cfg = _get_config().server
             validator = get_jwt_validator(cfg.jwt_public_key, cfg.jwks_url)
 
-        if is_target:
+        if route_scope is not None:
+            if not bearer_token:
+                return JSONResponse(
+                    {"error": "User-event JWT must use Bearer authentication"},
+                    status_code=401,
+                )
             if any(name.lower().startswith("x-agent-") for name in request.headers):
                 return JSONResponse(
                     {"error": "Evidence requests cannot set agent headers"},
@@ -2170,10 +2184,17 @@ class EvidenceAuthMiddleware(BaseHTTPMiddleware):
             if not token or validator is None:
                 return JSONResponse({"error": "Evidence JWT required"}, status_code=401)
             try:
-                claims = validator.validate_evidence(token)
+                claims = (
+                    validator.validate_evidence(token)
+                    if route_scope == "mnemory:evidence"
+                    else validator.validate_user_event(token)
+                )
             except (InvalidTokenError, ValueError, TypeError):
                 return JSONResponse({"error": "Invalid evidence JWT"}, status_code=401)
-            request.state.evidence_claims = claims
+            if route_scope == "mnemory:evidence":
+                request.state.evidence_claims = claims
+            else:
+                request.state.user_event_claims = claims
             request.state.evidence_token = True
             return await call_next(request)
 
@@ -2184,7 +2205,7 @@ class EvidenceAuthMiddleware(BaseHTTPMiddleware):
                 evidence_intent = False
             if evidence_intent:
                 return JSONResponse(
-                    {"error": "Evidence JWT is only valid for the evidence route"},
+                    {"error": "User-event JWT is only valid for its matching route"},
                     status_code=403,
                 )
         return await call_next(request)

@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import threading
 import unicodedata
 import uuid
 from typing import Any
@@ -41,10 +42,15 @@ def _normalize(value: Any) -> Any:
 
 def canonical_request_bytes(body: dict[str, Any]) -> bytes:
     """Return canonical method, route, and body bytes for request hashing."""
+    return _canonical_request_bytes_for_path(body, EVIDENCE_PATH)
+
+
+def _canonical_request_bytes_for_path(body: dict[str, Any], route: str) -> bytes:
+    """Return canonical method, route, and body bytes for one exact route."""
     envelope = {
         "body": _normalize(body),
         "method": "POST",
-        "route": EVIDENCE_PATH,
+        "route": route,
     }
     return json.dumps(
         envelope,
@@ -52,6 +58,11 @@ def canonical_request_bytes(body: dict[str, Any]) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def _canonical_request_hash_for_path(body: dict[str, Any], route: str) -> str:
+    """Return the SHA-256 hash of a canonical request at ``route``."""
+    return hashlib.sha256(_canonical_request_bytes_for_path(body, route)).hexdigest()
 
 
 def canonical_request_hash(body: dict[str, Any]) -> str:
@@ -108,6 +119,49 @@ def _claims_match_body(claims: dict[str, Any], body: EvidenceRememberRequest) ->
     return all(claims.get(name) == value for name, value in pairs.items())
 
 
+async def dispatch_trusted_event(
+    service: Any, body: Any, *, route: str
+) -> dict[str, Any] | None:
+    """Bridge verified route claims to shared semantic ownership and cancellation."""
+    body_dict = body.model_dump(mode="json")
+    event = body.event
+    cancel = threading.Event()
+    try:
+        result = await asyncio.to_thread(
+            service.process_trusted_event,
+            content=body.messages[0].content,
+            user_id=body.actor.user_id,
+            owner_id=body.actor.owner_id,
+            evidence_root_id=derive_evidence_root(body_dict),
+            source_event={
+                "protocol": EVIDENCE_PROTOCOL,
+                "event_id": event.id,
+                "event_hash": event.event_hash,
+                "cognis_session_id": event.cognis_session_id,
+                "conversation_id": event.conversation_id,
+                "turn_id": event.turn_id,
+                "evidence_root": derive_evidence_root(body_dict),
+            },
+            request_hashes={
+                "evidence": canonical_request_hash(body_dict),
+                "ingest": _canonical_request_hash_for_path(
+                    body_dict, "/api/user-events/remember/v1"
+                ),
+            },
+            route=route,
+            cancel=cancel,
+        )
+        if result is not None and result.get("outcome") == "rejected_before_write":
+            # Non-2xx keeps existing clients from acknowledging memory success.
+            # Only this durable canonical outcome is a terminal budget failure.
+            raise HTTPException(status_code=422, detail=result)
+        return result
+    finally:
+        # Cancelling to_thread does not stop its worker. Every semantic write
+        # checks this event and its journal fence before it can mutate.
+        cancel.set()
+
+
 @router.post("/evidence/remember/v1", response_model=dict)
 async def remember_evidence(
     request: Request,
@@ -137,6 +191,10 @@ async def remember_evidence(
     try:
         async with asyncio.timeout(EVIDENCE_WALL_BUDGET_SECONDS):
             service = _get_service()
+            semantic = await dispatch_trusted_event(service, body, route="evidence")
+            if semantic is not None:
+                _record(semantic["status"])
+                return semantic
             plan = await asyncio.to_thread(
                 service.plan_evidence,
                 [],

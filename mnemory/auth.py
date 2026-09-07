@@ -127,6 +127,22 @@ class CognisJWTValidator:
         self, token: str, *, now: float | None = None
     ) -> dict[str, Any]:
         """Validate the dedicated, non-fallback Cognis evidence token."""
+        return self._validate_user_event_token(
+            token, expected_scope="mnemory:evidence", now=now
+        )
+
+    def validate_user_event(
+        self, token: str, *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Validate the dedicated, non-fallback Cognis user-event token."""
+        return self._validate_user_event_token(
+            token, expected_scope="mnemory:remember:user", now=now
+        )
+
+    def _validate_user_event_token(
+        self, token: str, *, expected_scope: str, now: float | None
+    ) -> dict[str, Any]:
+        """Validate one Cognis user-event token for its exact route scope."""
         header = jwt.get_unverified_header(token)
         if header.get("alg") != "ES256":
             raise InvalidTokenError("Invalid evidence token header")
@@ -161,7 +177,7 @@ class CognisJWTValidator:
                 raise InvalidTokenError(f"Evidence {name} exceeds its size limit")
         if claims["typ"] != "user_event":
             raise InvalidTokenError("Invalid evidence token type")
-        if claims["scope"] != "mnemory:evidence":
+        if claims["scope"] != expected_scope:
             raise InvalidTokenError("Invalid evidence scope")
         if claims["evop"] != "remember" or claims.get("ver") != 1:
             raise InvalidTokenError("Invalid evidence operation")

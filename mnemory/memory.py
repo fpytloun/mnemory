@@ -51,7 +51,12 @@ from mnemory.prompts import (
     parse_extraction_response,
     parse_remember_extraction_response,
 )
-from mnemory.revisions import RevisionConflictError, canonical_fingerprint
+from mnemory.revisions import (
+    EvidenceConflictError,
+    EvidenceCorruptError,
+    RevisionConflictError,
+    canonical_fingerprint,
+)
 from mnemory.sanitize import (
     CORE_MEMORIES_PREAMBLE,
     detect_injection_patterns,
@@ -459,6 +464,9 @@ class MemoryService:
         _revision_metadata: dict[str, Any] | None = None,
         _source_kind: str | None = None,
         _source_event_id: str | None = None,
+        _source_event: dict[str, Any] | None = None,
+        _evidence_root_id: str | None = None,
+        _memory_layer: str = "consolidated",
         _validation_eligible: bool = False,
         _mutation_guard: Callable[[], None] | None = None,
     ) -> dict:
@@ -604,6 +612,9 @@ class MemoryService:
                 revision_metadata=_revision_metadata,
                 source_kind=_source_kind or "assistant_paraphrase",
                 source_event_id=_source_event_id,
+                source_event=_source_event,
+                evidence_root_id=_evidence_root_id,
+                memory_layer=_memory_layer,
                 validation_eligible=_validation_eligible,
                 mutation_guard=_mutation_guard,
             )
@@ -706,6 +717,313 @@ class MemoryService:
         self._category_cache.invalidate(user_id)
 
         return result
+
+    def process_trusted_event(
+        self, *, cancel: threading.Event, **kwargs: Any
+    ) -> dict[str, Any] | None:
+        """Own semantic effects after route-specific trusted authentication."""
+        from mnemory.trusted_events import process
+
+        token = _SUPPRESS_SENSITIVE_LLM_LOGS.set(True)
+        try:
+            result = process(self, cancel=cancel, **kwargs)
+            self._core_cache.invalidate_prefix(kwargs["user_id"])
+            self._category_cache.invalidate(kwargs["user_id"])
+            return result
+        finally:
+            _SUPPRESS_SENSITIVE_LLM_LOGS.reset(token)
+
+    def ingest_trusted_user_event(
+        self,
+        *,
+        content: str,
+        user_id: str,
+        owner_id: str,
+        evidence_root_id: str,
+        request_hash: str,
+        source_event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Persist one shared, validation-eligible raw user event.
+
+        This path intentionally performs no confirmation.  The evidence
+        endpoint is the only owner of validation transitions.
+        """
+        user_id = _validate_id(user_id, "user_id")
+        owner_id = _validate_id(owner_id, "owner_id")
+        if not content.strip():
+            raise ValueError("User-event content must be non-empty")
+        max_user_event_length = 1_000
+        if len(content) > max_user_event_length:
+            raise ValueError(
+                "User-event content exceeds the 1000-character trusted limit"
+            )
+
+        operations = self.revisions.operations
+        content_fingerprint = operations.user_event_content_fingerprint(
+            user_id=user_id,
+            owner_id=owner_id,
+            content=content,
+        )
+        content_claim_id = operations.user_event_content_claim_id(content_fingerprint)
+        operation_id = operations.user_event_operation_id(
+            protocol="mnemory.trusted-evidence.v1",
+            user_id=user_id,
+            owner_id=owner_id,
+            evidence_root_id=evidence_root_id,
+        )
+        lock = self._get_user_lock(user_id)
+        with lock:
+            operation = operations.prepare_user_event_ingestion(
+                protocol="mnemory.trusted-evidence.v1",
+                user_id=user_id,
+                owner_id=owner_id,
+                evidence_root_id=evidence_root_id,
+                request_fingerprint=request_hash,
+                memory_id=content_claim_id,
+                source_event=source_event,
+            )
+            if operation.get("status") == "committed":
+                replay_memory_id = operation.get("memory_id")
+                if not isinstance(replay_memory_id, str) or not replay_memory_id:
+                    raise EvidenceCorruptError(
+                        "Committed user-event operation has no memory"
+                    )
+                replay_memory = self.vector.get_by_id_strict(replay_memory_id)
+                if replay_memory is None:
+                    raise RuntimeError(
+                        "Committed user-event memory is not visible; retry"
+                    )
+                self._validate_trusted_user_event_memory(
+                    replay_memory,
+                    content=content,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                )
+                return {
+                    "status": "replayed",
+                    "operation_id": operation_id,
+                    "result": operation.get("result"),
+                }
+
+            claim = operations.claim_user_event_content(
+                content_fingerprint=content_fingerprint,
+                operation_id=operation_id,
+                user_id=user_id,
+                owner_id=owner_id,
+                memory_id=content_claim_id,
+                lease_seconds=5,
+            )
+            if claim.get("claim_owner") != operation_id:
+                memory_result = self._wait_for_user_event_winner(
+                    claim=claim,
+                    content=content,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    evidence_root_id=evidence_root_id,
+                    source_event=source_event,
+                    operations=operations,
+                    content_fingerprint=content_fingerprint,
+                    operation_id=operation_id,
+                    memory_id=content_claim_id,
+                )
+            else:
+                memory_result = self._ingest_owned_user_event(
+                    claim=claim,
+                    content=content,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    evidence_root_id=evidence_root_id,
+                    source_event=source_event,
+                    operations=operations,
+                    content_fingerprint=content_fingerprint,
+                    operation_id=operation_id,
+                    memory_id=content_claim_id,
+                )
+
+            committed = operations.complete_user_event_ingestion(
+                operation_id,
+                request_fingerprint=request_hash,
+                result=memory_result,
+            )
+            self._core_cache.invalidate_prefix(user_id)
+            self._category_cache.invalidate(user_id)
+            return {
+                "status": "accepted",
+                "operation_id": operation_id,
+                "result": committed.get("result", memory_result),
+            }
+
+    @staticmethod
+    def _validate_trusted_user_event_memory(
+        memory: dict[str, Any],
+        *,
+        content: str,
+        user_id: str,
+        owner_id: str,
+    ) -> None:
+        """Fail closed if a deterministic shared point has another identity."""
+        metadata = memory.get("metadata") or {}
+        if (
+            memory.get("memory") != content
+            or memory.get("user_id") != user_id
+            or memory.get("owner_id") != owner_id
+            or memory.get("agent_id") is not None
+            or metadata.get("role", "user") != "user"
+            or metadata.get("source_kind") != "raw_user_message"
+            or metadata.get("memory_layer") != "raw"
+        ):
+            raise EvidenceConflictError("User-event memory is already bound")
+
+    def _wait_for_user_event_winner(
+        self,
+        *,
+        claim: dict[str, Any],
+        content: str,
+        user_id: str,
+        owner_id: str,
+        evidence_root_id: str,
+        source_event: dict[str, Any],
+        operations: Any,
+        content_fingerprint: str,
+        operation_id: str,
+        memory_id: str,
+    ) -> dict[str, Any]:
+        """Wait for or take over a remote shared-content claim."""
+        deadline = time.monotonic() + 5.0
+        current = claim
+        while True:
+            winner = self.vector.get_by_id_strict(memory_id)
+            if winner is not None:
+                self._validate_trusted_user_event_memory(
+                    winner,
+                    content=content,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                )
+                return {
+                    "results": [{"id": memory_id, "memory": content, "event": "SKIP"}]
+                }
+            if current.get("status") == "committed":
+                raise EvidenceCorruptError(
+                    "Committed user-event content claim has no memory"
+                )
+            if time.monotonic() >= deadline:
+                current = operations.claim_user_event_content(
+                    content_fingerprint=content_fingerprint,
+                    operation_id=operation_id,
+                    user_id=user_id,
+                    owner_id=owner_id,
+                    memory_id=memory_id,
+                    lease_seconds=5,
+                )
+                if current.get("claim_owner") == operation_id:
+                    return self._ingest_owned_user_event(
+                        claim=current,
+                        content=content,
+                        user_id=user_id,
+                        owner_id=owner_id,
+                        evidence_root_id=evidence_root_id,
+                        source_event=source_event,
+                        operations=operations,
+                        content_fingerprint=content_fingerprint,
+                        operation_id=operation_id,
+                        memory_id=memory_id,
+                    )
+            time.sleep(0.05)
+            current = operations._user_event_readback(
+                operations.user_event_content_claim_id(content_fingerprint)
+            )
+            if current is None:
+                raise EvidenceCorruptError("User-event content claim disappeared")
+
+    def _ingest_owned_user_event(
+        self,
+        *,
+        claim: dict[str, Any],
+        content: str,
+        user_id: str,
+        owner_id: str,
+        evidence_root_id: str,
+        source_event: dict[str, Any],
+        operations: Any,
+        content_fingerprint: str,
+        operation_id: str,
+        memory_id: str,
+    ) -> dict[str, Any]:
+        """Insert and verify the deterministic shared point under its lease."""
+        claim_id = operations.user_event_content_claim_id(content_fingerprint)
+        claim_epoch = claim.get("claim_epoch")
+        claim_nonce = claim.get("claim_nonce")
+        if not isinstance(claim_epoch, int) or not isinstance(claim_nonce, str):
+            raise EvidenceCorruptError("User-event content claim fence is malformed")
+        operations.renew_user_event_content_claim(
+            claim_id,
+            operation_id=operation_id,
+            claim_epoch=claim_epoch,
+            claim_nonce=claim_nonce,
+            lease_seconds=30,
+        )
+        existing = self.vector.get_by_id_strict(memory_id)
+        if existing is not None:
+            self._validate_trusted_user_event_memory(
+                existing,
+                content=content,
+                user_id=user_id,
+                owner_id=owner_id,
+            )
+            memory_result = {
+                "results": [{"id": memory_id, "memory": content, "event": "ADD"}]
+            }
+        else:
+            memory_result = self._add_direct(
+                content,
+                user_id=user_id,
+                owner_id=owner_id,
+                agent_id=None,
+                memory_type=None,
+                categories=None,
+                importance=None,
+                pinned=None,
+                role="user",
+                ttl_days=None,
+                memory_id=memory_id,
+                source_kind="raw_user_message",
+                source_event_id=source_event.get("event_id"),
+                source_event=source_event,
+                evidence_root_id=evidence_root_id,
+                memory_layer="raw",
+                validation_eligible=True,
+                mutation_guard=lambda: operations.renew_user_event_content_claim(
+                    claim_id,
+                    operation_id=operation_id,
+                    claim_epoch=claim_epoch,
+                    claim_nonce=claim_nonce,
+                    lease_seconds=30,
+                ),
+            )
+            if memory_result.get("error"):
+                raise RuntimeError(
+                    memory_result.get("message", "User-event ingestion failed")
+                )
+            visible = self.vector.get_by_id_strict(memory_id)
+            if visible is None:
+                raise RuntimeError(
+                    "User-event memory write was not visible after acknowledgement"
+                )
+            self._validate_trusted_user_event_memory(
+                visible,
+                content=content,
+                user_id=user_id,
+                owner_id=owner_id,
+            )
+        operations.complete_user_event_content_claim(
+            claim_id,
+            operation_id=operation_id,
+            claim_epoch=claim_epoch,
+            claim_nonce=claim_nonce,
+            memory_id=memory_id,
+        )
+        return memory_result
 
     def _get_user_lock(self, user_id: str) -> threading.Lock:
         """Get or create a per-user lock for serializing remember calls."""
@@ -868,6 +1186,7 @@ class MemoryService:
         max_memory_length: int,
         session_timezone: str | None,
         context: str | None,
+        fail_closed: bool = False,
     ) -> tuple[list[dict[str, Any]], str, bool]:
         """Stage 1: Extract facts from conversation text.
 
@@ -912,6 +1231,8 @@ class MemoryService:
                     operation="remember_extract",
                 )
             except Exception:
+                if fail_closed:
+                    raise
                 logger.exception("Remember extraction LLM call failed")
                 return [], "", False
 
@@ -942,6 +1263,8 @@ class MemoryService:
 
             break
 
+        if fail_closed and not facts and not summary:
+            raise RuntimeError("Trusted extraction returned no complete result; retry")
         logger.info(
             "Remember Stage 1: extracted %d facts, summary=%d chars",
             len(facts),
@@ -1191,13 +1514,17 @@ class MemoryService:
         self,
         facts_with_candidates: list[dict[str, Any]],
         facts: list[dict[str, Any]],
+        *,
+        trusted: bool = False,
     ) -> list[dict[str, Any]]:
         """Make a single LLM call for dedup decisions.
 
         Returns list of action dicts compatible with _execute_action.
         Retries once and fails closed if output is missing or invalid.
         """
-        messages, json_schema, id_mapping = build_dedup_prompt(facts_with_candidates)
+        messages, json_schema, id_mapping = build_dedup_prompt(
+            facts_with_candidates, **({"trusted": True} if trusted else {})
+        )
 
         for attempt in range(2):
             try:
@@ -1708,6 +2035,8 @@ class MemoryService:
         source_fingerprint: str | None = None,
         evidence_root_id: str | None = None,
         validation_eligible: bool = False,
+        trusted_parent: dict[str, Any] | None = None,
+        mutation_guard: Callable[[], None] | None = None,
     ) -> dict[str, Any] | None:
         """Execute one validated ADD, UPDATE, CONFIRM, or SKIP action."""
         owner_id = owner_id or user_id
@@ -1761,6 +2090,20 @@ class MemoryService:
             effective_event_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
         if act == "ADD":
+            deterministic_id = action.get("memory_id") if trusted_parent else None
+            if deterministic_id:
+                existing = self.vector.get_by_id_strict(deterministic_id)
+                if existing is not None:
+                    if (
+                        existing.get("user_id") != user_id
+                        or existing.get("owner_id") != owner_id
+                        or existing.get("agent_id") is not None
+                        or existing.get("memory") != text
+                        or (existing.get("metadata") or {}).get("trusted_operation_id")
+                        != trusted_parent["operation_id"]
+                    ):
+                        raise EvidenceConflictError("Trusted ADD identity differs")
+                    return {"id": deterministic_id, "memory": text, "event": "ADD"}
             vector = vector_map.get(text)
             if vector is None:
                 vector = self.vector.embedding.embed(text)
@@ -1792,7 +2135,14 @@ class MemoryService:
                 metadata["labels"] = caller_labels
             ttl_meta = build_expiry_metadata(ttl_days, mem_type, self._config.memory)
             metadata.update(ttl_meta)
+            if trusted_parent:
+                metadata.update(action["expiry"])
+                metadata["trusted_operation_id"] = trusted_parent["operation_id"]
+                metadata["source_event"] = action["source_event"]
 
+            sparse_vector = self._get_sparse_vector(text)
+            if mutation_guard:
+                mutation_guard()
             memory_id = self.vector.insert(
                 text=text,
                 vector=vector,
@@ -1801,7 +2151,12 @@ class MemoryService:
                 agent_id=agent_id,
                 metadata=metadata,
                 role=role,
-                sparse_vector=self._get_sparse_vector(text),
+                sparse_vector=sparse_vector,
+                **(
+                    {"memory_id": deterministic_id, "only_if_absent": True}
+                    if deterministic_id
+                    else {}
+                ),
             )
             return {"id": memory_id, "memory": text, "event": "ADD"}
 
@@ -1817,7 +2172,7 @@ class MemoryService:
                 and action.get("_candidate_validated")
             ):
                 existing = {"id": target_id, "metadata": {}}
-            if not self._is_valid_inferred_target(
+            if not trusted_parent and not self._is_valid_inferred_target(
                 existing,
                 target_id=target_id,
                 user_id=user_id,
@@ -1829,7 +2184,7 @@ class MemoryService:
                 )
                 return None
 
-            existing_meta = existing.get("metadata") or {}
+            existing_meta = (existing or {}).get("metadata") or {}
             changes = {
                 "data": text,
                 "memory_type": mem_type,
@@ -1852,28 +2207,47 @@ class MemoryService:
             }
             if effective_event_date is not None:
                 changes["event_date"] = effective_event_date
-            elif existing_meta.get("event_date"):
+            elif existing_meta.get("event_date") and not trusted_parent:
                 changes["event_date"] = existing_meta["event_date"]
             changes.update(
                 build_expiry_metadata(ttl_days, mem_type, self._config.memory)
             )
+            if trusted_parent:
+                changes.update(action["expiry"])
+                changes["source_event"] = action["source_event"]
+                changes["consumed_evidence_root_ids"] = [evidence_root_id]
             existing_labels = existing_meta.get("labels", {})
             caller_labels = explicit_fields.get("labels")
             if caller_labels is not None:
                 merged_labels = {**existing_labels, **caller_labels}
                 if merged_labels:
                     changes["labels"] = merged_labels
-            elif existing_labels:
+            elif existing_labels and not trusted_parent:
                 changes["labels"] = existing_labels
+            if mutation_guard:
+                mutation_guard()
             result = self.revisions.revise(
                 target_id,
                 user_id=user_id,
                 owner_id=owner_id,
                 session_agent_id=agent_id,
                 changes=changes,
-                idempotency_key=f"remember:{canonical_fingerprint(changes)}",
+                idempotency_key=(
+                    f"trusted:{trusted_parent['operation_id']}:{action['ordinal']}"
+                    if trusted_parent
+                    else f"remember:{canonical_fingerprint(changes)}"
+                ),
                 operation_kind="remember_update",
-                actor_kind="remember",
+                actor_kind="user_event" if trusted_parent else "remember",
+                **(
+                    {
+                        "expected_revision": action["snapshot"]["revision"],
+                        "expected_content_hash": action["snapshot"]["content_hash"],
+                        "mutation_guard": mutation_guard,
+                    }
+                    if trusted_parent
+                    else {}
+                ),
             )
             return {
                 "id": result["revision_id"],
@@ -1911,6 +2285,8 @@ class MemoryService:
                     "Rejected stale or inaccessible CONFIRM target %s", target_id
                 )
                 return {"id": target_id, "memory": text, "event": "SKIP"}
+            if mutation_guard:
+                mutation_guard()
             result = self.revisions.confirm(
                 target_id,
                 user_id=user_id,
@@ -1921,6 +2297,20 @@ class MemoryService:
                 source_fingerprint=source_fingerprint,
                 ttl_multiplier=self._config.memory.validation_ttl_multiplier,
                 max_score_roots=self._config.memory.validation_max_score_roots,
+                **(
+                    {
+                        "expected_revision_id": action["snapshot"]["revision_id"],
+                        "expected_lineage_id": action["snapshot"]["lineage_id"],
+                        "expected_content_hash": action["snapshot"]["content_hash"],
+                        "expected_fact_hash": action["snapshot"]["fact_hash"],
+                        "parent_operation_id": trusted_parent["operation_id"],
+                        "parent_epoch": trusted_parent["claim_epoch"],
+                        "parent_nonce": trusted_parent["claim_nonce"],
+                        "idempotency_key": f"{trusted_parent['operation_id']}:{action['ordinal']}",
+                    }
+                    if trusted_parent
+                    else {}
+                ),
             )
             from mnemory.metrics import get_collector
 
@@ -2112,10 +2502,14 @@ class MemoryService:
             response = self._llm.generate(
                 messages,
                 json_schema={
-                    "type": "object",
-                    "properties": {"equivalent": {"type": "boolean"}},
-                    "required": ["equivalent"],
-                    "additionalProperties": False,
+                    "name": "evidence_equivalence",
+                    "strict": True,
+                    "schema": {
+                        "type": "object",
+                        "properties": {"equivalent": {"type": "boolean"}},
+                        "required": ["equivalent"],
+                        "additionalProperties": False,
+                    },
                 },
                 operation="evidence_semantic_equivalence",
             )
@@ -2383,6 +2777,9 @@ class MemoryService:
         revision_metadata: dict[str, Any] | None = None,
         source_kind: str = "assistant_paraphrase",
         source_event_id: str | None = None,
+        source_event: dict[str, Any] | None = None,
+        evidence_root_id: str | None = None,
+        memory_layer: str = "consolidated",
         validation_eligible: bool = False,
         mutation_guard: Callable[[], None] | None = None,
     ) -> dict:
@@ -2463,6 +2860,11 @@ class MemoryService:
             user_id,
         )
 
+        source_fingerprint = canonical_fingerprint(
+            [owner_id, source_kind, source_event_id, content]
+            if source_event is None
+            else [owner_id, source_kind, source_event_id, source_event, content]
+        )
         metadata = {
             "memory_type": memory_type,
             "categories": categories or [],
@@ -2470,25 +2872,21 @@ class MemoryService:
             "pinned": pinned,
             "artifacts": [],
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
-            "memory_layer": "consolidated",
+            "memory_layer": memory_layer,
             "source_kind": source_kind,
-            "source_fingerprint": canonical_fingerprint(
-                [owner_id, source_kind, source_event_id, content]
-            ),
+            "source_fingerprint": source_fingerprint,
             "validation_eligible": validation_eligible,
             "evidence_root_ids": (
-                [
-                    canonical_fingerprint(
-                        [owner_id, source_kind, source_event_id, content]
-                    )
-                ]
-                if validation_eligible
-                else []
+                [evidence_root_id or source_fingerprint] if validation_eligible else []
             ),
             "consumed_evidence_root_ids": [],
             "validation_count": 0,
             "validation_strength": 0.0,
         }
+        if source_event_id is not None:
+            metadata["source_event_id"] = source_event_id
+        if source_event is not None:
+            metadata["source_event"] = source_event
         if event_date is not None:
             metadata["event_date"] = event_date
         if labels:

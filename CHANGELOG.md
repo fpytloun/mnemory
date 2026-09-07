@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.14.0] — 2026-09-07
+
+### Added
+
+- **Trusted user-event ingestion** — Added a shared authenticated event endpoint for trusted callers to record memory updates.
+- **Trusted evidence journal** — Added durable event, ownership, and release-fence records for trusted memory operations.
+
+### Changed
+
+- **Semantic revision processing** — Unified trusted event handling with revision lineage, recovery, and pre-write ownership fences.
+- **Rejection handling** — Preserved terminal trusted-operation rejections for deterministic replay and audit results.
+
 ## [1.13.0] — 2026-09-06
 
 ### Added

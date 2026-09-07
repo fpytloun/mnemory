@@ -4,6 +4,81 @@ mnemory exposes a full REST API alongside the MCP server. The FastAPI sub-app is
 
 Both MCP and REST share the same `MemoryService` backend and authentication middleware. Authentication may use API keys (`Authorization: Bearer <key>` / `X-API-Key`) or Cognis-issued ES256 JWTs (`Authorization: Bearer <jwt>` with `aud=mnemory`). The OpenAPI document and Swagger UI are public metadata for client import; documented API operations still require authentication.
 
+## Trusted semantic user events
+
+`POST /api/user-events/remember/v1` and `POST /api/evidence/remember/v1`
+share semantic ownership for new authenticated event roots. Each route still
+requires its own route-bound signed request. Ordinary API keys cannot use either
+route or supply trusted provenance.
+
+The service extracts atomic facts, retrieves shared-user Qdrant candidates, and
+uses the existing deduplication LLM. Similarity alone does not authorize a write.
+The immutable journal plan contains `ADD`, `CONFIRM`, `UPDATE`, or `SKIP` actions.
+ADD establishes provenance with zero confirmations. CONFIRM requires complete
+semantic equivalence and an independent root. UPDATE creates a successor revision.
+Partial support cannot confirm an entire multi-fact consolidated memory.
+
+Both routes return the same canonical result for one root. A repeated route call
+returns `replayed` without new semantic effects. Historical terminal journals
+remain terminal and are not processed again by the new pipeline.
+
+A lease in the existing operations collection serializes trusted semantic
+decisions within the exact shared user/owner scope. Other users remain independent.
+This lease does not serialize ordinary tool writes. Target revision checks remain
+required. Persisted actions and deterministic ADD identities support recovery
+after a partial write.
+
+The message limit is separate from the extracted-memory limit. Oversized input
+or extraction output fails explicitly before memory writes; the service does not
+truncate the signed source or store it unconditionally as one fact.
+
+Cognis can retain paired route delivery, but must sign each request for its actual
+route. Prefer one ingest call per event to avoid a redundant replay request.
+The evidence route now shares ADD/UPDATE semantics for new authenticated roots,
+not only CONFIRM semantics. No credential scope changes are required.
+
+### Terminal pre-write rejection
+
+Both trusted routes return HTTP `422` with a structured `detail` object for a
+durable budget rejection. Its fields are:
+
+| Field | Value |
+|---|---|
+| `status` | `rejected` |
+| `outcome` | `rejected_before_write` |
+| `operation_id` | Canonical event operation UUID |
+| `reason` | One reason from the list below |
+| `terminal` | `true` |
+| `retryable` | `false` |
+| `fallback_allowed` | `false` |
+| `semantic_effects` | `none` |
+| `source_retention` | `caller_queue` |
+
+Reasons: `input_budget_exceeded`, `extraction_fact_budget_exceeded`,
+`action_limit_exceeded`, or `plan_budget_exceeded`.
+
+The canonical journal atomically commits an empty rejection record before any
+semantic actions for this root exist. Its committed state means durable failure,
+not successful extraction. Both routes replay the identical HTTP failure without
+another LLM call, even after configuration changes. Existing sealed actions cannot
+be replaced by a rejection. Historical journal recovery remains unchanged.
+
+Client handling:
+
+1. Match HTTP `422` and `detail.outcome == "rejected_before_write"`, not HTTP status alone.
+2. Mark the existing queue work as terminal failed and retain its complete original
+   signed payload, provenance, operation ID, and reason.
+3. Surface the failure. Do not acknowledge successful memory extraction.
+4. Do not invoke ordinary remember as fallback. Its input truncation is not lossless.
+5. On a timeout, HTTP `503`, or any unknown outcome, resume the same authenticated
+   root. Never infer that no effects occurred.
+
+`source_retention` names the existing caller queue's responsibility. Mnemory keeps
+the canonical fingerprint/root binding, not another copy of the rejected source
+as a memory. The Cognis failure-retention change must accompany deployment.
+Schema-level HTTP `422` validation errors do not carry this durable outcome.
+Arbitrarily large messages are not guaranteed successful extraction.
+
 ## Memory CRUD
 
 | Endpoint | Method | Description |

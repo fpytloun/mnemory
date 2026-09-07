@@ -32,6 +32,7 @@ from mnemory.api.evidence import (
 )
 from mnemory.api.schemas import EvidenceRememberRequest
 from mnemory.auth import CognisJWTValidator
+from mnemory.config import MemoryConfig
 from mnemory.memory import MemoryService
 from mnemory.revisions import RevisionOperationStore, RevisionService
 from mnemory.storage.vector import VectorStore
@@ -317,6 +318,7 @@ def test_endpoint_runs_plan_seal_claim_apply_without_logging_content(
         }
     )
     service = SimpleNamespace(
+        process_trusted_event=lambda **kwargs: None,  # Legacy nonterminal recovery.
         vector=SimpleNamespace(get_all=lambda **kwargs: {"results": []}),
         revisions=SimpleNamespace(operations=operations),
         plan_evidence=lambda *args, **kwargs: {
@@ -382,26 +384,48 @@ def _real_evidence_service(
         vector=SimpleNamespace(is_remote=False, collection_name="memories")
     )
     vector._embedding = SimpleNamespace(
-        embed_batch=lambda texts: [[1.0, 0.0] for _ in texts]
+        embed_batch=lambda texts: [[1.0, 0.0] for _ in texts],
+        embed=lambda text: [1.0, 0.0],
     )
     service = MemoryService.__new__(MemoryService)
     service._config = SimpleNamespace(
-        memory=SimpleNamespace(
-            max_memory_length=1000,
-            validation_enabled=True,
-            validation_ttl_multiplier=1.0,
-            validation_max_score_roots=3,
-        )
+        memory=MemoryConfig(validation_enabled=True, validation_ttl_multiplier=1.0)
     )
     service.vector = vector
     service.revisions = RevisionService(vector)
     service._remember_extract = lambda *args, **kwargs: (
-        [{"text": "User lives in Prague"}],
+        [
+            {
+                "text": "User lives in Prague",
+                "memory_type": "fact",
+                "categories": [],
+                "importance": "normal",
+                "pinned": False,
+            }
+        ],
         None,
         None,
     )
     service._get_available_categories = lambda _user_id: []
-    service._evidence_semantic_equivalence = lambda *args: True
+    service._evidence_semantic_equivalence = lambda source, target, assertion: (
+        target == assertion
+    )
+    service._llm = SimpleNamespace(
+        generate=lambda *args, **kwargs: json.dumps(
+            {
+                "decisions": [
+                    {
+                        "fact_index": 0,
+                        "action": "CONFIRM",
+                        "target_id": "0",
+                        "text": "User lives in Prague",
+                    }
+                ]
+            }
+        )
+    )
+    service._core_cache = SimpleNamespace(invalidate_prefix=lambda prefix: None)
+    service._category_cache = SimpleNamespace(invalidate=lambda user: None)
     return service, client
 
 
@@ -479,7 +503,7 @@ def test_signed_endpoint_plans_real_search_targets_once(
     operation = service.revisions.operations.get_evidence_plan(operation_id)
     assert operation is not None
     assert (
-        operation["targets"][0]["source_hash"]
+        operation["targets"][0]["snapshot"]["content_hash"]
         == hashlib.sha256(b"User lives in Prague").hexdigest()
     )
 
@@ -528,7 +552,8 @@ def test_signed_endpoint_skips_partial_consolidated_search_target(
             headers={"Authorization": f"Bearer {token}"},
         )
     assert response.status_code == 200
-    assert response.json()["status"] == "skipped"
+    assert response.json()["status"] == "accepted"
+    assert response.json()["result"]["results"][0]["event"] == "SKIP"
     target = client.retrieve(
         collection_name="memories",
         ids=[target_id],

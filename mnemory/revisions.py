@@ -39,6 +39,7 @@ EVIDENCE_PLAN_PROTOCOL = "mnemory.trusted-evidence.v1"
 EVIDENCE_MAX_TARGETS = 32
 EVIDENCE_MAX_PLAN_BYTES = 64 * 1024
 EVIDENCE_CLAIM_DEADLINE_SECONDS = 90
+USER_EVENT_CONTENT_CLAIM_KIND = "user_event_content_claim"
 FSCK_AUDIT_OPERATION_KIND = "fsck_audit"
 FSCK_AUDIT_MODE = "exact_audit"
 FSCK_AUDIT_MAX_TARGETS = 20
@@ -130,6 +131,25 @@ class EvidenceLeaseLostError(RevisionConflictError):
     """Raised when a worker no longer owns an evidence lease."""
 
 
+class TrustedBudgetRejection(ValueError):
+    """Known budget failure before any semantic plan or child is written."""
+
+    REASONS = frozenset(
+        {
+            "input_budget_exceeded",
+            "extraction_fact_budget_exceeded",
+            "action_limit_exceeded",
+            "plan_budget_exceeded",
+        }
+    )
+
+    def __init__(self, reason: str):
+        if reason not in self.REASONS:
+            raise ValueError("Unknown trusted budget reason")
+        self.reason = reason
+        super().__init__(reason)
+
+
 class RevisionOperationStore:
     """Durable revision operation journal and audit store."""
 
@@ -199,6 +219,8 @@ class RevisionOperationStore:
             "protocol": "keyword",
             "evidence_root_id": "keyword",
             "request_fingerprint": "keyword",
+            "content_fingerprint": "keyword",
+            "claim_owner": "keyword",
             "target_ids": "keyword",
             "claim_epoch": "integer",
             "claim_nonce": "keyword",
@@ -601,6 +623,398 @@ class RevisionOperationStore:
         return str(uuid.uuid5(uuid.NAMESPACE_URL, f"mnemory:evidence:{token}"))
 
     @staticmethod
+    def user_event_operation_id(
+        *,
+        protocol: str,
+        user_id: str,
+        owner_id: str,
+        evidence_root_id: str,
+    ) -> str:
+        """Return the deterministic operation ID for one user-event root."""
+        token = canonical_fingerprint([protocol, user_id, owner_id, evidence_root_id])
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"mnemory:user-event:{token}"))
+
+    @staticmethod
+    def user_event_content_fingerprint(
+        *, user_id: str, owner_id: str, content: str
+    ) -> str:
+        """Return the shared-memory deduplication key for raw user content."""
+        return canonical_fingerprint(["user_event_content", user_id, owner_id, content])
+
+    @staticmethod
+    def user_event_content_claim_id(content_fingerprint: str) -> str:
+        """Return the deterministic operation point for a shared-content claim."""
+        return str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"mnemory:user-event-content:{content_fingerprint}",
+            )
+        )
+
+    def claim_user_event_content(
+        self,
+        *,
+        content_fingerprint: str,
+        operation_id: str,
+        user_id: str,
+        owner_id: str,
+        memory_id: str,
+        lease_seconds: int = EVIDENCE_CLAIM_DEADLINE_SECONDS,
+    ) -> dict[str, Any]:
+        """Atomically claim one shared content key, with bounded stale takeover."""
+        claim_id = self.user_event_content_claim_id(content_fingerprint)
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=max(lease_seconds, 1))
+        body = {
+            "operation_id": claim_id,
+            "operation_kind": USER_EVENT_CONTENT_CLAIM_KIND,
+            "content_fingerprint": content_fingerprint,
+            "user_id": user_id,
+            "owner_id": owner_id,
+            "claim_owner": operation_id,
+            "claim_nonce": uuid.uuid4().hex,
+            "claim_epoch": 1,
+            "claim_started_at_utc": now.isoformat(),
+            "lease_expires_at": expires.isoformat(),
+            "memory_id": memory_id,
+            "status": "claimed",
+        }
+        self._client.upsert(
+            collection_name=OPERATIONS_COLLECTION,
+            points=[PointStruct(id=claim_id, vector=[0.0], payload=body)],
+            update_filter=Filter(must_not=[HasIdCondition(has_id=[claim_id])]),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        winner = self._user_event_readback(claim_id)
+        if winner is None:
+            raise EvidenceCorruptError("User-event content claim is not readable")
+        if winner.get("operation_kind") != USER_EVENT_CONTENT_CLAIM_KIND:
+            raise EvidenceConflictError("User-event content claim identity conflict")
+        if (
+            winner.get("user_id") != user_id
+            or winner.get("owner_id") != owner_id
+            or winner.get("content_fingerprint") != content_fingerprint
+        ):
+            raise EvidenceConflictError("User-event content claim scope conflict")
+        if winner.get("claim_owner") == operation_id:
+            return winner
+        if winner.get("status") == "committed":
+            return winner
+        lease = winner.get("lease_expires_at")
+        try:
+            lease_expired = (
+                datetime.fromisoformat(str(lease)).astimezone(timezone.utc) <= now
+            )
+        except ValueError:
+            lease_expired = True
+        if not lease_expired:
+            return winner
+        epoch = int(winner.get("claim_epoch", 0))
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={
+                "claim_owner": operation_id,
+                "claim_nonce": uuid.uuid4().hex,
+                "claim_epoch": epoch + 1,
+                "claim_started_at_utc": now.isoformat(),
+                "lease_expires_at": expires.isoformat(),
+                "memory_id": memory_id,
+                "status": "claimed",
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[claim_id]),
+                    FieldCondition(
+                        key="operation_kind",
+                        match=MatchValue(value=USER_EVENT_CONTENT_CLAIM_KIND),
+                    ),
+                    FieldCondition(key="claim_epoch", match=MatchValue(value=epoch)),
+                    FieldCondition(
+                        key="lease_expires_at", range=DatetimeRange(lte=now)
+                    ),
+                ]
+            ),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        winner = self._user_event_readback(claim_id)
+        if winner is None:
+            raise EvidenceCorruptError("User-event content claim disappeared")
+        return winner
+
+    def renew_user_event_content_claim(
+        self,
+        claim_id: str,
+        *,
+        operation_id: str,
+        claim_epoch: int,
+        claim_nonce: str,
+        lease_seconds: int = EVIDENCE_CLAIM_DEADLINE_SECONDS,
+        require_live: bool = False,
+    ) -> dict[str, Any]:
+        """Renew a claim only when its owner, epoch, and nonce still match."""
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(seconds=max(lease_seconds, 1))
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={"lease_expires_at": expires.isoformat()},
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[claim_id]),
+                    FieldCondition(
+                        key="operation_kind",
+                        match=MatchValue(value=USER_EVENT_CONTENT_CLAIM_KIND),
+                    ),
+                    FieldCondition(
+                        key="claim_owner", match=MatchValue(value=operation_id)
+                    ),
+                    FieldCondition(
+                        key="claim_epoch", match=MatchValue(value=claim_epoch)
+                    ),
+                    FieldCondition(
+                        key="claim_nonce", match=MatchValue(value=claim_nonce)
+                    ),
+                    FieldCondition(key="status", match=MatchValue(value="claimed")),
+                ]
+                + (
+                    [
+                        FieldCondition(
+                            key="lease_expires_at", range=DatetimeRange(gt=now)
+                        )
+                    ]
+                    if require_live
+                    else []
+                )
+            ),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        renewed = self._user_event_readback(claim_id)
+        if (
+            renewed is None
+            or renewed.get("claim_owner") != operation_id
+            or renewed.get("claim_epoch") != claim_epoch
+            or renewed.get("claim_nonce") != claim_nonce
+            or renewed.get("status") != "claimed"
+            or (require_live and renewed.get("lease_expires_at") != expires.isoformat())
+        ):
+            raise EvidenceLeaseLostError("User-event content claim was fenced")
+        return renewed
+
+    def release_trusted_scope_claim(
+        self, claim: dict[str, Any], *, pending_operation_id: str | None = None
+    ) -> None:
+        """Release this exact scope fence, retaining unfinished plan ownership."""
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={
+                "lease_expires_at": datetime.now(timezone.utc).isoformat(),
+                "memory_id": pending_operation_id or claim["memory_id"],
+            },
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[claim["operation_id"]]),
+                    FieldCondition(
+                        key="claim_owner", match=MatchValue(value=claim["claim_owner"])
+                    ),
+                    FieldCondition(
+                        key="claim_epoch", match=MatchValue(value=claim["claim_epoch"])
+                    ),
+                    FieldCondition(
+                        key="claim_nonce", match=MatchValue(value=claim["claim_nonce"])
+                    ),
+                ]
+            ),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+
+    def bind_trusted_scope_plan(self, claim: dict[str, Any], operation_id: str) -> None:
+        """Bind crash recovery to a plan before its first durable action."""
+        self.renew_user_event_content_claim(
+            claim["operation_id"],
+            operation_id=claim["claim_owner"],
+            claim_epoch=claim["claim_epoch"],
+            claim_nonce=claim["claim_nonce"],
+            lease_seconds=15,
+            require_live=True,
+        )
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={"memory_id": operation_id},
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[claim["operation_id"]]),
+                    FieldCondition(
+                        key="claim_owner", match=MatchValue(value=claim["claim_owner"])
+                    ),
+                    FieldCondition(
+                        key="claim_epoch", match=MatchValue(value=claim["claim_epoch"])
+                    ),
+                    FieldCondition(
+                        key="claim_nonce", match=MatchValue(value=claim["claim_nonce"])
+                    ),
+                ]
+            ),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        record = self._user_event_readback(claim["operation_id"])
+        if not record or record.get("memory_id") != operation_id:
+            raise EvidenceLeaseLostError("Trusted scope plan binding was fenced")
+
+    def complete_user_event_content_claim(
+        self,
+        claim_id: str,
+        *,
+        operation_id: str,
+        claim_epoch: int,
+        claim_nonce: str,
+        memory_id: str,
+    ) -> dict[str, Any]:
+        """Publish a claimed shared memory only after its point is visible."""
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={"status": "committed", "memory_id": memory_id},
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[claim_id]),
+                    FieldCondition(
+                        key="operation_kind",
+                        match=MatchValue(value=USER_EVENT_CONTENT_CLAIM_KIND),
+                    ),
+                    FieldCondition(
+                        key="claim_owner", match=MatchValue(value=operation_id)
+                    ),
+                    FieldCondition(
+                        key="claim_epoch", match=MatchValue(value=claim_epoch)
+                    ),
+                    FieldCondition(
+                        key="claim_nonce", match=MatchValue(value=claim_nonce)
+                    ),
+                    FieldCondition(key="status", match=MatchValue(value="claimed")),
+                ]
+            ),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        committed = self._user_event_readback(claim_id)
+        if (
+            committed is None
+            or committed.get("status") != "committed"
+            or committed.get("claim_owner") != operation_id
+            or committed.get("claim_epoch") != claim_epoch
+            or committed.get("claim_nonce") != claim_nonce
+            or committed.get("memory_id") != memory_id
+        ):
+            raise EvidenceLeaseLostError("User-event content claim was lost")
+        return committed
+
+    def prepare_user_event_ingestion(
+        self,
+        *,
+        protocol: str,
+        user_id: str,
+        owner_id: str,
+        evidence_root_id: str,
+        request_fingerprint: str,
+        memory_id: str,
+        source_event: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Durably reserve one root and reject root/request conflicts."""
+        operation_id = self.user_event_operation_id(
+            protocol=protocol,
+            user_id=user_id,
+            owner_id=owner_id,
+            evidence_root_id=evidence_root_id,
+        )
+        body = {
+            "operation_id": operation_id,
+            "operation_kind": "user_event_ingestion",
+            "protocol": protocol,
+            "actor_kind": "user_event",
+            "user_id": user_id,
+            "owner_id": owner_id,
+            "agent_id": None,
+            "evidence_root_id": evidence_root_id,
+            "request_fingerprint": request_fingerprint,
+            "memory_id": memory_id,
+            "source_event": source_event,
+            "status": "prepared",
+        }
+        self._client.upsert(
+            collection_name=OPERATIONS_COLLECTION,
+            points=[PointStruct(id=operation_id, vector=[0.0], payload=body)],
+            update_filter=Filter(must_not=[HasIdCondition(has_id=[operation_id])]),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        winner = self._user_event_readback(operation_id)
+        if winner is None:
+            raise EvidenceCorruptError("User-event operation insert was not readable")
+        immutable = (
+            winner.get("operation_kind") == "user_event_ingestion"
+            and winner.get("protocol") == protocol
+            and winner.get("user_id") == user_id
+            and winner.get("owner_id") == owner_id
+            and winner.get("evidence_root_id") == evidence_root_id
+        )
+        if not immutable or winner.get("request_fingerprint") != request_fingerprint:
+            raise EvidenceConflictError(
+                "User-event root is already bound to another request",
+                code="idempotency_conflict",
+            )
+        return winner
+
+    def _user_event_readback(self, operation_id: str) -> dict[str, Any] | None:
+        """Read a user-event operation with replica-consistent visibility."""
+        result = self._client.retrieve(
+            collection_name=OPERATIONS_COLLECTION,
+            ids=[operation_id],
+            with_payload=True,
+            with_vectors=False,
+            consistency="all",
+        )
+        return dict(result[0].payload or {}) if result else None
+
+    def complete_user_event_ingestion(
+        self,
+        operation_id: str,
+        *,
+        request_fingerprint: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Commit a prepared user-event operation and return its record."""
+        current = self._user_event_readback(operation_id)
+        if current is None:
+            raise EvidenceCorruptError("User-event operation is missing")
+        if current.get("request_fingerprint") != request_fingerprint:
+            raise EvidenceConflictError("User-event request conflict")
+        if current.get("status") == "committed":
+            return current
+        self._client.set_payload(
+            collection_name=OPERATIONS_COLLECTION,
+            payload={"status": "committed", "result": result},
+            points=Filter(
+                must=[
+                    HasIdCondition(has_id=[operation_id]),
+                    FieldCondition(
+                        key="request_fingerprint",
+                        match=MatchValue(value=request_fingerprint),
+                    ),
+                    FieldCondition(key="status", match=MatchValue(value="prepared")),
+                ]
+            ),
+            ordering=WriteOrdering.STRONG,
+            wait=True,
+        )
+        committed = self._user_event_readback(operation_id)
+        if committed is None or committed.get("status") != "committed":
+            raise EvidenceLeaseLostError("User-event operation commit was lost")
+        return committed
+
+    @staticmethod
     def _evidence_record_valid(record: dict[str, Any]) -> bool:
         """Validate the immutable fields required by the evidence journal."""
         targets = record.get("targets")
@@ -618,7 +1032,12 @@ class RevisionOperationStore:
             and len(targets) <= EVIDENCE_MAX_TARGETS
             and all(isinstance(target, dict) for target in targets)
             and all(
-                target.get("action") in {"CONFIRM", "SKIP"}
+                target.get("action")
+                in (
+                    {"ADD", "UPDATE", "CONFIRM", "SKIP"}
+                    if record.get("protocol") == "mnemory.trusted-semantic.v1"
+                    else {"CONFIRM", "SKIP"}
+                )
                 and isinstance(target.get("ordinal"), int)
                 and target.get("ordinal") == index
                 for index, target in enumerate(targets)
@@ -655,6 +1074,7 @@ class RevisionOperationStore:
         evidence_root_id: str,
         request_fingerprint: str,
         targets: list[dict[str, Any]],
+        terminal_rejection: str | None = None,
     ) -> dict[str, Any]:
         """Atomically persist or resume one complete, immutable evidence plan."""
         if len(targets) > EVIDENCE_MAX_TARGETS:
@@ -685,12 +1105,35 @@ class RevisionOperationStore:
             "checkpoints": [],
             "created_at_utc": datetime.now(timezone.utc).isoformat(),
         }
+        if terminal_rejection is not None:
+            if (
+                protocol != "mnemory.trusted-semantic.v1"
+                or targets
+                or terminal_rejection not in TrustedBudgetRejection.REASONS
+            ):
+                raise ValueError("Invalid terminal pre-write rejection")
+            # Insert-only at the canonical ID: never overwrite a sealed or
+            # partially applied plan. Committed means the rejection is durable,
+            # not that semantic extraction succeeded.
+            body["status"] = "committed"
+            body["result"] = {
+                "status": "rejected",
+                "outcome": "rejected_before_write",
+                "reason": terminal_rejection,
+                "terminal": True,
+                "retryable": False,
+                "fallback_allowed": False,
+                "semantic_effects": "none",
+                "source_retention": "caller_queue",
+            }
         encoded_size = len(
             json.dumps(
                 body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode()
         )
         if encoded_size > EVIDENCE_MAX_PLAN_BYTES:
+            if protocol == "mnemory.trusted-semantic.v1" and terminal_rejection is None:
+                raise TrustedBudgetRejection("plan_budget_exceeded")
             raise ValueError("Evidence plan exceeds 64 KiB")
         self._client.upsert(
             collection_name=OPERATIONS_COLLECTION,
@@ -991,10 +1434,10 @@ class RevisionOperationStore:
             raise EvidenceConflictError("Evidence checkpoints are incomplete")
         seen: set[int] = set()
         for item in checkpoints:
-            if not isinstance(item, dict) or item.get("status") not in {
-                "confirmed",
-                "skipped",
-            }:
+            terminal_states = {"confirmed", "skipped"}
+            if record.get("protocol") == "mnemory.trusted-semantic.v1":
+                terminal_states.update({"added", "updated"})
+            if not isinstance(item, dict) or item.get("status") not in terminal_states:
                 raise EvidenceConflictError("Evidence checkpoint is not terminal")
             ordinal = item.get("ordinal")
             if (
@@ -1087,7 +1530,6 @@ class RevisionOperationStore:
                 and isinstance(payload.get("lineage_id"), str)
                 and isinstance(payload.get("revision"), int)
                 and claim_content_hash == payload.get("hash")
-                and claim_fact_hash == stored_fact_hash
             )
             if semantic_equivalence is not None and isinstance(source_text, str):
                 equivalent = equivalent and semantic_equivalence(
@@ -1095,6 +1537,10 @@ class RevisionOperationStore:
                     str(payload.get("data", "")),
                     claim.get("assertion_text"),
                 )
+            else:
+                # Hash equality remains the conservative fallback for legacy
+                # callers without a semantic adjudicator, not its prerequisite.
+                equivalent = equivalent and claim_fact_hash == stored_fact_hash
             for field in ("lineage_id", "revision", "revision_id"):
                 if field in claim and claim[field] != target.get(field):
                     equivalent = False
@@ -2865,8 +3311,12 @@ class RevisionService:
         reason: str | None = None,
         derived_from: list[str] | None = None,
         audit: dict[str, Any] | None = None,
+        mutation_guard: Callable[[], None] | None = None,
+        expected_content_hash: str | None = None,
     ) -> dict[str, Any]:
         """Create and activate an immutable successor revision."""
+        if mutation_guard:
+            mutation_guard()
         current, current_payload, points = self._resolve(memory_id)
         self._authorize(
             current_payload,
@@ -2948,6 +3398,11 @@ class RevisionService:
             self._raise_stale(current_payload, current_id)
         if expected_revision is not None and expected_revision != current_revision:
             self._raise_stale(current_payload, current_id)
+        if (
+            expected_content_hash is not None
+            and current_payload.get("hash") != expected_content_hash
+        ):
+            self._raise_stale(current_payload, current_id)
 
         successor_id = _successor_point_id(token)
         successor_payload = dict(current_payload)
@@ -2968,6 +3423,13 @@ class RevisionService:
                 + (self._payload(item).get("evidence_root_ids") or [])
             )
         )
+        if actor_kind == "user_event":
+            historical_consumed = list(
+                dict.fromkeys(
+                    historical_consumed
+                    + list(changes.get("consumed_evidence_root_ids") or [])
+                )
+            )
         if historical_consumed:
             successor_payload["consumed_evidence_root_ids"] = historical_consumed
         semantic_transformation = "data" in changes or "derived_from" in changes
@@ -2978,7 +3440,11 @@ class RevisionService:
                     "validation_strength": 0.0,
                     "validation_state": "unverified",
                     "last_validated_at": None,
-                    "evidence_root_ids": [],
+                    "evidence_root_ids": (
+                        list(changes.get("evidence_root_ids") or [])
+                        if actor_kind == "user_event"
+                        else []
+                    ),
                 }
             )
         now = datetime.now(timezone.utc).isoformat()
@@ -3005,6 +3471,8 @@ class RevisionService:
                 dense = self._vector.embedding.embed(text)
                 sparse = self._sparse_embed(text) if self._sparse_embed else None
                 vector = {"": dense, "bm25": sparse} if sparse is not None else dense
+            if mutation_guard:
+                mutation_guard()
             self._client.upsert(
                 collection_name=self._vector.collection_name,
                 points=[
@@ -3042,9 +3510,13 @@ class RevisionService:
         }
         if audit:
             operation_payload.update(audit)
+        if mutation_guard:
+            mutation_guard()
         self.operations.write(token, operation_payload)
 
         try:
+            if mutation_guard:
+                mutation_guard()
             claimed_payload = self._claim(
                 point_id=current_id,
                 payload=current_payload,
@@ -3070,6 +3542,8 @@ class RevisionService:
             )
             self._raise_stale(claimed_payload, current_id)
 
+        if mutation_guard:
+            mutation_guard()
         self._client.set_payload(
             collection_name=self._vector.collection_name,
             payload={"revision_state": ACTIVE_REVISION_STATE},
@@ -3088,6 +3562,8 @@ class RevisionService:
             wait=True,
         )
         self.operations.write(token, {**operation_payload, "status": "activated"})
+        if mutation_guard:
+            mutation_guard()
         self._client.set_payload(
             collection_name=self._vector.collection_name,
             payload={

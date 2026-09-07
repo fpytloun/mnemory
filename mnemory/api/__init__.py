@@ -127,7 +127,7 @@ def _add_openapi_security(spec: dict[str, Any]) -> dict[str, Any]:
                 continue
             if (path, method.lower()) in public_operations:
                 operation.setdefault("security", [])
-            elif path == "/evidence/remember/v1":
+            elif path in {"/evidence/remember/v1", "/user-events/remember/v1"}:
                 operation["security"] = [{"CognisEvidence": []}]
             else:
                 operation.setdefault(
@@ -179,6 +179,7 @@ def create_api_app() -> FastAPI:
     from mnemory.api.remember import router as remember_router
     from mnemory.api.sessions import router as sessions_router
     from mnemory.api.ui import router as ui_router
+    from mnemory.api.user_events import router as user_events_router
 
     app.include_router(auth_router, tags=["auth"])
     app.include_router(evidence_router, tags=["evidence"])
@@ -189,6 +190,7 @@ def create_api_app() -> FastAPI:
     app.include_router(sessions_router, tags=["sessions"])
     app.include_router(fsck_router, prefix="/fsck", tags=["fsck"])
     app.include_router(ui_router, tags=["ui"])
+    app.include_router(user_events_router, tags=["user-events"])
 
     # Override OpenAPI schema generation to sanitize for OpenAI compatibility.
     # Pydantic v2 / OpenAPI 3.1 emits "anyOf": [{"type": "X"}, {"type": "null"}]

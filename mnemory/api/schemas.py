@@ -43,6 +43,15 @@ class EvidenceMessage(BaseModel):
     content: str = Field(..., min_length=1, max_length=400_000)
 
 
+class UserEventMessage(BaseModel):
+    """The signed source message, not an individual extracted memory."""
+
+    model_config = {"extra": "forbid"}
+
+    role: Literal["user"]
+    content: str = Field(..., min_length=1, max_length=400_000)
+
+
 class EvidenceRememberRequest(BaseModel):
     """Strict body contract for the trusted evidence endpoint."""
 
@@ -53,12 +62,47 @@ class EvidenceRememberRequest(BaseModel):
     event: EvidenceEvent
     messages: list[EvidenceMessage] = Field(..., min_length=1, max_length=1)
 
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, value: Any) -> Any:
+        """Reject bool because Python treats it as equal to integer one."""
+        if isinstance(value, bool):
+            raise ValueError("Evidence version must be integer 1")
+        return value
+
     @field_validator("messages")
     @classmethod
     def validate_message(cls, value: list[EvidenceMessage]) -> list[EvidenceMessage]:
         """Reject a structurally present but empty user message."""
         if not value or not value[0].content.strip():
             raise ValueError("Evidence message content must be non-empty")
+        return value
+
+
+class UserEventRememberRequest(BaseModel):
+    """Strict body contract for trusted user-event ingestion."""
+
+    model_config = {"extra": "forbid"}
+
+    version: Literal[1]
+    actor: EvidenceActor
+    event: EvidenceEvent
+    messages: list[UserEventMessage] = Field(..., min_length=1, max_length=1)
+
+    @field_validator("version", mode="before")
+    @classmethod
+    def validate_version(cls, value: Any) -> Any:
+        """Reject bool because Python treats it as equal to integer one."""
+        if isinstance(value, bool):
+            raise ValueError("User-event version must be integer 1")
+        return value
+
+    @field_validator("messages")
+    @classmethod
+    def validate_message(cls, value: list[UserEventMessage]) -> list[UserEventMessage]:
+        """Reject a structurally present but empty user message."""
+        if not value or not value[0].content.strip():
+            raise ValueError("User-event message content must be non-empty")
         return value
 
 

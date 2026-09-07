@@ -330,6 +330,7 @@ class VectorStore:
         role: str = "user",
         sparse_vector: Any = None,
         memory_id: str | None = None,
+        only_if_absent: bool = False,
     ) -> str:
         """Insert a new memory point.
 
@@ -385,6 +386,17 @@ class VectorStore:
                     points=[
                         PointStruct(id=memory_id, vector=point_vector, payload=payload)
                     ],
+                    ordering=WriteOrdering.STRONG,
+                    wait=True,
+                    **(
+                        {
+                            "update_filter": Filter(
+                                must_not=[HasIdCondition(has_id=[memory_id])]
+                            )
+                        }
+                        if only_if_absent
+                        else {}
+                    ),
                 )
         return memory_id
 

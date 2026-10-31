@@ -8,9 +8,11 @@ import { test } from "node:test";
 test("npm package contains a loadable compiled OpenClaw entry", () => {
   const temp = mkdtempSync(join(tmpdir(), "mnemory-package-"));
   try {
-    const [packed] = JSON.parse(execFileSync("npm", [
+    const result = JSON.parse(execFileSync("npm", [
       "pack", "--json", "--pack-destination", temp,
     ], { encoding: "utf8" }));
+    const packed = Array.isArray(result) ? result[0] : result["@fpytloun/openclaw-mnemory"];
+    assert.ok(packed, "npm pack did not return package metadata");
     execFileSync("tar", ["-xzf", join(temp, packed.filename), "-C", temp]);
     const packageDir = join(temp, "package");
     const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));

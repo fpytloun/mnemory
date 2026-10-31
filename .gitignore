@@ -19,6 +19,7 @@ env/
 # Node
 node_modules/
 package-lock.json
+!integrations/openclaw/package-lock.json
 
 # Benchmark artifacts
 benchmarks/locomo/data/

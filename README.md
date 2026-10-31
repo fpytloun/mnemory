@@ -4,9 +4,11 @@
 
 # mnemory
 
-Deletion is intentionally **best effort**, not a verified-erasure or compliance
-guarantee. Normal deletion retracts and preserves history; explicit privacy
-erasure attempts physical cleanup. See [deletion limits](docs/deletion.md).
+> **Looking for a complete Agent OS?** Meet [Cognis](https://github.com/fpytloun/cognis) —
+> a cloud-native, self-hosted workspace where AI agents do real work. Bring
+> together conversations, tools, workflows, and remote executors, with
+> long-term memory powered by mnemory and guardrails provided by
+> [Intaris](https://github.com/fpytloun/intaris).
 
 Give your AI agents persistent memory. mnemory is a self-hosted [MCP](https://modelcontextprotocol.io/) server that adds personalization and long-term memory to any AI assistant — Claude Code, ChatGPT, Open WebUI, Cursor, or any MCP-compatible client.
 

@@ -1,6 +1,6 @@
 {
   "name": "@fpytloun/openclaw-mnemory",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "OpenClaw plugin for mnemory — long-term semantic memory with auto-recall/capture and explicit tools",
   "type": "module",
   "license": "MIT",
@@ -14,8 +14,16 @@
   "bugs": {
     "url": "https://github.com/fpytloun/mnemory/issues"
   },
+  "scripts": {
+    "build": "esbuild index.ts client.ts config.ts --outdir=dist --platform=node --format=esm",
+    "prepack": "npm run build",
+    "test:package": "node --test package.test.mjs"
+  },
   "dependencies": {
     "@sinclair/typebox": "0.34.48"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12"
   },
   "peerDependencies": {
     "openclaw": ">=2026.3.11"
@@ -31,6 +39,7 @@
     ]
   },
   "files": [
+    "dist/*.js",
     "*.ts",
     "!*.test.ts",
     "openclaw.plugin.json",

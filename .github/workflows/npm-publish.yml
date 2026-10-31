@@ -27,7 +27,11 @@ jobs:
 
       - name: Install dependencies
         working-directory: integrations/openclaw
-        run: npm install --omit=dev
+        run: npm ci
+
+      - name: Verify package contents
+        working-directory: integrations/openclaw
+        run: npm run test:package
 
       - name: Publish to npm
         working-directory: integrations/openclaw

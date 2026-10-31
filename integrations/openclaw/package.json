@@ -1,6 +1,6 @@
 {
   "name": "@fpytloun/openclaw-mnemory",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "OpenClaw plugin for mnemory — long-term semantic memory with auto-recall/capture and explicit tools",
   "type": "module",
   "license": "MIT",

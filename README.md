@@ -10,6 +10,10 @@
 > long-term memory powered by mnemory and guardrails provided by
 > [Intaris](https://github.com/fpytloun/intaris).
 
+Deletion is intentionally **best effort**, not a verified-erasure or compliance
+guarantee. Normal deletion retracts and preserves history; explicit privacy
+erasure attempts physical cleanup. See [deletion limits](docs/deletion.md).
+
 Give your AI agents persistent memory. mnemory is a self-hosted [MCP](https://modelcontextprotocol.io/) server that adds personalization and long-term memory to any AI assistant — Claude Code, ChatGPT, Open WebUI, Cursor, or any MCP-compatible client.
 
 **Plug and play.** Connect mnemory and your agent immediately starts remembering user preferences, facts, decisions, and context across conversations. No system prompt changes needed.

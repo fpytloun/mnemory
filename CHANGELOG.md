@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.15.2] — 2026-11-01
+
+### Fixed
+
+- Ship compiled JavaScript alongside the OpenClaw plugin sources, lock the build
+  dependency, and verify that the packaged runtime loads before npm publication.
+
+### Distribution
+
+- Publish multi-architecture container images to
+  `ghcr.io/fpytloun/mnemory`, with source-repository labels and tested tag rules.
+- Document GHCR pull/build commands and retain the best-effort deletion warning
+  alongside the Cognis introduction.
+
 ## [1.15.1] — 2026-10-19
 
 ### Fixed

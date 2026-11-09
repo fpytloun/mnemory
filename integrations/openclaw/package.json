@@ -17,7 +17,8 @@
   "scripts": {
     "build": "esbuild index.ts client.ts config.ts --outdir=dist --platform=node --format=esm",
     "prepack": "npm run build",
-    "test:package": "node --test package.test.mjs"
+    "test:package": "node --test package.test.mjs",
+    "test:openclaw": "node --test openclaw.test.mjs"
   },
   "dependencies": {
     "@sinclair/typebox": "0.34.48"

@@ -1,0 +1,37 @@
+name: Test OpenClaw Plugin
+
+on:
+  pull_request:
+    paths:
+      - "integrations/openclaw/**"
+      - ".github/workflows/openclaw-test.yml"
+  push:
+    branches: [main]
+    paths:
+      - "integrations/openclaw/**"
+      - ".github/workflows/openclaw-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        openclaw: ["2026.10.9", "2026.11.2"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - run: npm install -g openclaw@${{ matrix.openclaw }}
+      - run: npm ci
+        working-directory: integrations/openclaw
+      - run: npm run test:package
+        working-directory: integrations/openclaw
+      - run: npx --yes vitest@4.0.8 run index.test.ts
+        working-directory: integrations/openclaw
+      - run: npm run test:openclaw
+        working-directory: integrations/openclaw

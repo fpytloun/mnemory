@@ -1,6 +1,25 @@
 {
   "id": "mnemory",
   "kind": "memory",
+  "contracts": {
+    "tools": [
+      "memory_search",
+      "memory_find",
+      "memory_ask",
+      "memory_add",
+      "memory_add_batch",
+      "memory_update",
+      "memory_delete",
+      "memory_delete_batch",
+      "memory_list",
+      "memory_categories",
+      "memory_recent",
+      "memory_save_artifact",
+      "memory_get_artifact",
+      "memory_list_artifacts",
+      "memory_delete_artifact"
+    ]
+  },
   "uiHints": {
     "url": {
       "label": "Mnemory Server URL",

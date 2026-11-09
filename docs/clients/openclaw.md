@@ -29,6 +29,7 @@ Add to your `openclaw.json`:
     // Activate mnemory as the memory slot (only one memory plugin at a time)
     "slots": { "memory": "mnemory" },
     "entries": {
+      "memory-core": { "enabled": false },
       "mnemory": {
         "enabled": true,
         "config": {
@@ -42,6 +43,13 @@ Add to your `openclaw.json`:
 ```
 
 Config values support `${ENV_VAR}` syntax for environment variable resolution.
+
+Restart the OpenClaw Gateway after changing this configuration. Explicitly
+disabling `memory-core` is important: on OpenClaw 2026.10.9 and 2026.11.2, selecting
+the memory slot alone can leave native `memory_search` active and shadow mnemory's
+tool. This disables the native plugin's file-memory tools and background
+consolidation, but does not delete existing memory files. Do not deny
+`memory_search` through tool policy, because that would block mnemory's tool too.
 
 ### 3. Configuration Options
 
@@ -64,7 +72,11 @@ The plugin can be configured via OpenClaw's settings UI (the manifest provides a
 
 ### 4. Verify
 
-Start OpenClaw and send a message. You should see `mnemory: initialized` in the gateway logs. Memories will appear in the mnemory management UI at `http://localhost:8050/ui`.
+Start OpenClaw and send a message. You should see `mnemory: initialized` in the
+gateway logs and no `plugin tool name conflict (mnemory): memory_search`
+diagnostic. Ask the agent to call `memory_search` and verify that its results come
+from mnemory rather than local `MEMORY.md` files. Memories will appear in the
+mnemory management UI at `http://localhost:8050/ui`.
 
 ## MCP Setup
 
@@ -115,5 +127,5 @@ The plugin adds CLI commands under `openclaw mnemory`:
 
 - The plugin and MCP tools work together -- plugin handles automatic recall/remember, MCP tools handle explicit search/update/delete
 - Memory persists across session compaction (the plugin re-fetches after compaction)
-- The plugin declares `kind: "memory"` and is activated via `plugins.slots.memory: "mnemory"`. Only one memory plugin can be active at a time
+- Select `plugins.slots.memory: "mnemory"` and disable `plugins.entries.memory-core.enabled` to replace native memory tools
 - See the [coding assistant system prompt guide](../system-prompts/claude-code.md) for tips on what gets remembered

@@ -29,6 +29,7 @@ In your `openclaw.json`:
   plugins: {
     slots: { memory: "mnemory" },
     entries: {
+      "memory-core": { enabled: false },
       mnemory: {
         enabled: true,
         config: {
@@ -75,7 +76,25 @@ Config values support `${ENV_VAR}` syntax for environment variable resolution.
 
 ## Memory Slot
 
-This plugin declares `kind: "memory"` and is activated by setting `plugins.slots.memory: "mnemory"`. Only one memory plugin can be active at a time.
+This plugin declares `kind: "memory"` and is activated by setting
+`plugins.slots.memory: "mnemory"`. Also explicitly disable `memory-core` as shown
+above, then restart the OpenClaw Gateway.
+
+On OpenClaw 2026.10.9 and 2026.11.2, selecting the memory slot alone can leave the
+native `memory_search` tool active. It shadows mnemory's tool and produces a
+`plugin tool name conflict (mnemory): memory_search` diagnostic. Disabling
+`memory-core` makes mnemory own `memory_search` without renaming it. This also
+disables the native plugin's file-memory tools and background consolidation;
+existing memory files are not deleted.
+
+Do not add `memory_search` to `tools.deny`: that would also block mnemory's tool.
+
+## Development
+
+With OpenClaw installed, run `npm ci`, `npm run test:package`, and
+`npm run test:openclaw`. The integration test installs the packed plugin into
+temporary OpenClaw state, starts a real Gateway, and invokes all 15 tools against
+a local REST fixture. It needs no model or mnemory credentials.
 
 ## License
 

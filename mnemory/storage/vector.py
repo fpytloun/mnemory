@@ -1968,51 +1968,33 @@ class VectorStore:
 
         Args:
             date_start: Start date (YYYY-MM-DD), inclusive.
-            date_end: End date (YYYY-MM-DD), inclusive. The end date
-                is extended to end-of-day (23:59:59) for created_at
-                comparison.
+            date_end: End date (YYYY-MM-DD), inclusive. Both timestamp
+                fields use an exclusive upper bound at the next UTC midnight.
 
         Returns:
             A Qdrant Filter with OR logic, or None if no dates provided.
         """
-        from qdrant_client.models import (
-            DatetimeRange,
-            IsEmptyCondition,
-        )
-
         if not date_start and not date_end:
             return None
 
-        # Build range for event_date (YYYY-MM-DD string comparison)
-        event_date_range: dict[str, Any] = {}
-        created_at_range: dict[str, Any] = {}
-
+        # Both event_date and created_at are stored as ISO 8601 timestamps.
+        bounds: dict[str, datetime] = {}
         if date_start:
-            # event_date is stored as YYYY-MM-DD string
-            event_date_range["gte"] = date_start
-            # created_at is stored as ISO 8601 datetime
-            created_at_range["gte"] = datetime.fromisoformat(
-                f"{date_start}T00:00:00+00:00"
-            )
+            bounds["gte"] = datetime.fromisoformat(f"{date_start}T00:00:00+00:00")
         if date_end:
-            event_date_range["lte"] = date_end
-            # End of day for created_at
-            created_at_range["lte"] = datetime.fromisoformat(
-                f"{date_end}T23:59:59+00:00"
-            )
+            bounds["lt"] = datetime.fromisoformat(
+                f"{date_end}T00:00:00+00:00"
+            ) + timedelta(days=1)
 
         # Branch 1: event_date exists and is in range
-        event_date_conditions: list = []
-        from qdrant_client.models import Range
-
-        event_date_conditions.append(
-            FieldCondition(key="event_date", range=Range(**event_date_range))
-        )
+        event_date_conditions = [
+            FieldCondition(key="event_date", range=DatetimeRange(**bounds))
+        ]
 
         # Branch 2: event_date is missing AND created_at is in range
         no_event_date_conditions: list = [
             IsEmptyCondition(is_empty=PayloadField(key="event_date")),
-            FieldCondition(key="created_at", range=DatetimeRange(**created_at_range)),
+            FieldCondition(key="created_at", range=DatetimeRange(**bounds)),
         ]
 
         return Filter(

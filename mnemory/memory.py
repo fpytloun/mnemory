@@ -3510,6 +3510,7 @@ class MemoryService:
 
         Raises:
             ValueError: If LLM calls fail (query generation or reranking).
+            RuntimeError: If a generated search query fails.
         """
         user_id = _validate_id(user_id, "user_id")
         owner_id = _validate_id(owner_id, "owner_id") if owner_id else user_id
@@ -3551,8 +3552,20 @@ class MemoryService:
         date_start: str | None = None
         date_end: str | None = None
         if isinstance(date_range, dict):
-            date_start = date_range.get("start")
-            date_end = date_range.get("end")
+            # A generated range must be grounded in the question, not the
+            # current date or background context supplied in the prompt.
+            source_text = date_range.get("source_text")
+            if (
+                isinstance(source_text, str)
+                and source_text.strip()
+                and source_text.casefold() in question.casefold()
+            ):
+                date_start = date_range.get("start")
+                date_end = date_range.get("end")
+            else:
+                logger.warning(
+                    "find_memories: ignoring ungrounded generated date range"
+                )
             if date_start or date_end:
                 logger.info(
                     "find_memories: date range filter: %s to %s",
@@ -3644,9 +3657,9 @@ class MemoryService:
             for future in futures:
                 try:
                     results = future.result()
-                except Exception:
-                    logger.warning("find_memories: search failed for a query")
-                    continue
+                except Exception as exc:
+                    logger.exception("find_memories: search failed for a query")
+                    raise RuntimeError("Failed to search memories") from exc
 
                 total_searched += len(results)
 

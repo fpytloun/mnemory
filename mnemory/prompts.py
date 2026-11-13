@@ -1436,19 +1436,24 @@ simple lookups, more for complex multi-faceted questions.
 
 ## Date range filtering
 
-When the question has a temporal component, set date_range to narrow \
-results to the relevant time period. Convert relative references to \
-absolute dates using Today's date.
+Set date_range ONLY when the user's question explicitly restricts the time \
+period to search. First copy the exact temporal phrase from the question \
+into source_text, then convert it to absolute start and end dates. \
+Today's date is only a reference for resolving relative phrases; it is \
+NOT a default search period. Background context must not create a date filter.
 
 Examples:
-- "What happened last week?" → date_range: {{"start": "2026-02-19", "end": "2026-02-26"}}
-- "What did I do in January?" → date_range: {{"start": "2026-01-01", "end": "2026-01-31"}}
-- "Recent events" → date_range: {{"start": "2026-02-12", "end": "2026-02-26"}} (last 2 weeks)
+- "What happened last week?" → date_range: {{"source_text": "last week", "start": "2026-02-19", "end": "2026-02-26"}}
+- "What did I do in January?" → date_range: {{"source_text": "in January", "start": "2026-01-01", "end": "2026-01-31"}}
+- "Recent events" → date_range: {{"source_text": "Recent", "start": "2026-02-12", "end": "2026-02-26"}} (last 2 weeks)
+- "What is Mnemory?" → date_range: null
+- "What car do I have?" → date_range: null
 
-Set date_range to null when the question has no temporal component \
-(e.g., "What car do I have?", "What are my preferences?").
+Use null when there is no explicit temporal restriction. Present-tense \
+questions about facts or preferences do not restrict when a memory was \
+created or when an event occurred.
 
-Return ONLY a JSON object: {{"queries": [...], "date_range": {{"start": "...", "end": "..."}} | null}}"""
+Return ONLY a JSON object: {{"queries": [...], "date_range": {{"source_text": "...", "start": "...", "end": "..."}} | null}}"""
 
 QUERY_GENERATION_SCHEMA: dict[str, Any] = {
     "name": "query_generation",
@@ -1469,6 +1474,14 @@ QUERY_GENERATION_SCHEMA: dict[str, Any] = {
                     "Set to null for non-temporal questions."
                 ),
                 "properties": {
+                    "source_text": {
+                        "type": "string",
+                        "description": (
+                            "Exact phrase from the user's question that explicitly "
+                            "restricts the search time period. Never use today's "
+                            "date or additional context as the source."
+                        ),
+                    },
                     "start": {
                         "type": "string",
                         "description": "Start date (YYYY-MM-DD), inclusive",
@@ -1478,7 +1491,7 @@ QUERY_GENERATION_SCHEMA: dict[str, Any] = {
                         "description": "End date (YYYY-MM-DD), inclusive",
                     },
                 },
-                "required": ["start", "end"],
+                "required": ["source_text", "start", "end"],
                 "additionalProperties": False,
             },
         },

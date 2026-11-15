@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.15.3] — 2026-11-15
+
+### Fixed
+
+- Declare OpenClaw plugin tools for discovery and document how to replace native
+  memory tools. Test the packaged plugin against supported OpenClaw versions.
+- Correct temporal recall filters for event dates, creation dates, and undated
+  memories. Preserve date bounds when generating search queries.
+
 ## [1.15.2] — 2026-11-01
 
 ### Fixed

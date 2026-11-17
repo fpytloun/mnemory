@@ -82,7 +82,7 @@ With `infer=false`, the LLM call is skipped — the content is embedded and stor
 
 1. You call `find_memories(question="What do I think about dogs? Should I buy one?")`
 2. LLM generates multiple search queries covering different angles and associations (e.g., dogs, pets, partner, house, garden, lifestyle). Temporal-aware — knows today's date to resolve "last week", "recently", etc.
-3. Each query runs through `search_memories` independently
+3. Each query runs through `search_memories` independently. When the question names a time period, each query also runs once scoped to that period. This only adds candidates; it never removes undated or out-of-range memories
 4. Results are merged and deduplicated across all queries
 5. LLM reranks all results by relevance to the original question, using `event_date` metadata for temporal scoring
 6. Returns top N results with scores on the same 0.0-1.0 scale

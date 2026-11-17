@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from mnemory.cache import TTLCache
@@ -3562,6 +3562,20 @@ class MemoryService:
             ):
                 date_start = date_range.get("start")
                 date_end = date_range.get("end")
+                # Small models may emit other formats (e.g. "17/11/2026").
+                # The range is only a candidate hint, so drop it instead of
+                # failing the whole search.
+                try:
+                    for value in (date_start, date_end):
+                        if value:
+                            date.fromisoformat(value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "find_memories: ignoring invalid generated date range %r to %r",
+                        date_start,
+                        date_end,
+                    )
+                    date_start = date_end = None
             else:
                 logger.warning(
                     "find_memories: ignoring ungrounded generated date range"

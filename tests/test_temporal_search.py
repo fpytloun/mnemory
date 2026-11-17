@@ -81,6 +81,23 @@ def test_generated_date_range_does_not_hide_memories_outside_it(service, source_
     assert [m["id"] for m in result["results"]] == [memory_id]
 
 
+@pytest.mark.parametrize("bad_date", ["17/11/2026", "today", "2026-17-11"])
+def test_unparseable_generated_dates_do_not_fail_search(service, bad_date):
+    memory_id = insert(service)
+    service._find_llm.generate.return_value = json.dumps(
+        {
+            "queries": ["Mnemory"],
+            "date_range": {"source_text": "today", "start": bad_date, "end": bad_date},
+        }
+    )
+
+    result = service.find_memories(
+        "What did I note today about Mnemory?", user_id="alice"
+    )
+
+    assert [m["id"] for m in result["results"]] == [memory_id]
+
+
 def test_unreranked_results_stay_in_score_order_with_date_range(service):
     best = insert(service)
     in_range = insert(

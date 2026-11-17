@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from mnemory.cache import TTLCache
@@ -3562,13 +3562,27 @@ class MemoryService:
             ):
                 date_start = date_range.get("start")
                 date_end = date_range.get("end")
+                # Small models may emit other formats (e.g. "17/11/2026").
+                # The range is only a candidate hint, so drop it instead of
+                # failing the whole search.
+                try:
+                    for value in (date_start, date_end):
+                        if value:
+                            date.fromisoformat(value)
+                except (TypeError, ValueError):
+                    logger.warning(
+                        "find_memories: ignoring invalid generated date range %r to %r",
+                        date_start,
+                        date_end,
+                    )
+                    date_start = date_end = None
             else:
                 logger.warning(
                     "find_memories: ignoring ungrounded generated date range"
                 )
             if date_start or date_end:
                 logger.info(
-                    "find_memories: date range filter: %s to %s",
+                    "find_memories: date range candidates: %s to %s",
                     date_start,
                     date_end,
                 )
@@ -3627,34 +3641,46 @@ class MemoryService:
 
         t_embed = time.monotonic() - t_step
 
-        # Step 3: Run all queries through search in parallel, collect results
+        # Step 3: Run all queries through search in parallel, collect results.
+        # A generated date range only adds candidates from that period; it
+        # never removes undated or out-of-range memories. The reranker judges
+        # temporal relevance, so a wrong generated range cannot hide matches.
         t_step = time.monotonic()
         per_query_limit = limit * 2
         merged_by_id: dict[str, dict] = {}
+        in_range_ids: set[str] = set()
+        date_scopes: list[tuple[str | None, str | None]] = [(None, None)]
+        if date_start or date_end:
+            date_scopes.append((date_start, date_end))
 
-        with ThreadPoolExecutor(max_workers=len(valid_queries)) as pool:
+        search_count = len(valid_queries) * len(date_scopes)
+        with ThreadPoolExecutor(max_workers=search_count) as pool:
             futures = [
-                pool.submit(
-                    self._run_find_search,
-                    q,
-                    qvec,
-                    svec,
-                    user_id=user_id,
-                    owner_id=owner_id,
-                    session_agent_id=session_agent_id,
-                    agent_id=agent_id,
-                    memory_type=memory_type,
-                    categories=categories,
-                    role=role,
-                    limit=per_query_limit,
-                    include_decayed=include_decayed,
-                    date_start=date_start,
-                    date_end=date_end,
-                    labels=labels,
+                (
+                    scope_start is not None or scope_end is not None,
+                    pool.submit(
+                        self._run_find_search,
+                        q,
+                        qvec,
+                        svec,
+                        user_id=user_id,
+                        owner_id=owner_id,
+                        session_agent_id=session_agent_id,
+                        agent_id=agent_id,
+                        memory_type=memory_type,
+                        categories=categories,
+                        role=role,
+                        limit=per_query_limit,
+                        include_decayed=include_decayed,
+                        date_start=scope_start,
+                        date_end=scope_end,
+                        labels=labels,
+                    ),
                 )
                 for q, qvec, svec in zip(valid_queries, query_vectors, sparse_vectors)
+                for scope_start, scope_end in date_scopes
             ]
-            for future in futures:
+            for in_range, future in futures:
                 try:
                     results = future.result()
                 except Exception as exc:
@@ -3667,13 +3693,24 @@ class MemoryService:
                     mid = mem.get("id")
                     if not mid:
                         continue
+                    if in_range:
+                        in_range_ids.add(mid)
                     existing = merged_by_id.get(mid)
                     if existing is None:
                         merged_by_id[mid] = mem
                     elif mem.get("score", 0) > existing.get("score", 0):
                         existing["score"] = mem["score"]
 
-        merged = list(merged_by_id.values())
+        merged = sorted(
+            merged_by_id.values(), key=lambda m: m.get("score", 0), reverse=True
+        )
+        # Reserve the first `limit` places for in-range memories, so the
+        # pre-rerank cut cannot drop candidates that only the date-scoped
+        # search retrieved. The rest stay in score order, so a wrong range
+        # cannot crowd out the best unscoped matches either.
+        reserved = [m for m in merged if m["id"] in in_range_ids][:limit]
+        reserved_ids = {m["id"] for m in reserved}
+        merged = reserved + [m for m in merged if m["id"] not in reserved_ids]
 
         t_search = time.monotonic() - t_step
 
@@ -3726,8 +3763,7 @@ class MemoryService:
             }
 
         # Step 5: Pre-filter to top candidates before reranking (performance)
-        # Sort by vector score and take top limit*3 to reduce LLM payload
-        merged.sort(key=lambda m: m.get("score", 0), reverse=True)
+        # Take the top limit*3 to reduce LLM payload
         rerank_candidates = merged[: limit * 3]
         pre_filtered = len(merged) - len(rerank_candidates)
 

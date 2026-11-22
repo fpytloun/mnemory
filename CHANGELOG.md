@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Add `ALLOW_ASSISTANT_VERBATIM` (off by default) to allow assistant-role
+  memories to be stored as written when `ALLOW_CLIENT_INFER` is enabled.
+  REST and MCP add-memory responses report the effective inference mode.
+
 ## [1.15.3] — 2026-11-15
 
 ### Fixed

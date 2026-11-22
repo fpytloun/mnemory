@@ -755,7 +755,8 @@ class TestAddMemoriesTool:
         try:
             mock_service = MagicMock()
             mock_service.add_memory.return_value = {
-                "results": [{"id": "mem-1", "event": "ADD"}]
+                "results": [{"id": "mem-1", "event": "ADD"}],
+                "infer": infer,
             }
             with patch("mnemory.server._get_service", return_value=mock_service):
                 raw = asyncio.run(add_memories(memories=memories, infer=infer))
@@ -796,9 +797,10 @@ class TestAddMemoriesTool:
 
     def test_infer_false_passed_to_service(self):
         memories = [{"content": "test"}]
-        _, service = self._call(memories, infer=False)
+        result, service = self._call(memories, infer=False)
         _, kwargs = service.add_memory.call_args
         assert kwargs["infer"] is False
+        assert result["infer"] is False
 
 
 # ── Sub-agent support ─────────────────────────────────────────────────

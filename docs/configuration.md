@@ -176,6 +176,7 @@ EMBED_BASE_URL=https://api.openai.com/v1
 | `LABELS_MAX_VALUE_LENGTH` | `1000` | Max length of a string label value |
 | `LABELS_INDEXES` | | Comma-separated list of label keys to index in Qdrant for fast filtering (e.g., `project,topic,conversation_id`). Only needed for remote Qdrant with large datasets |
 | `ALLOW_CLIENT_INFER` | `true` | Whether client-facing tools (MCP, REST) can use `infer=False`. When `false`, `infer` is always forced to `true` for client requests. Internal callers (consolidation, remember) are unaffected |
+| `ALLOW_ASSISTANT_VERBATIM` | `false` | Allow client requests (MCP, REST) to store assistant-role memories with `infer=False` when `ALLOW_CLIENT_INFER` is also `true`. This server-wide setting increases the risk of persistent prompt injection. Enable only with authentication enforced and trusted clients on all memory-write paths |
 | `CONSOLIDATION_LLM_MODEL` | | Optional separate LLM model for consolidation. Falls back to `FSCK_LLM_MODEL`, then `LLM_MODEL`. Consolidation benefits from a stronger model |
 | `CONSOLIDATION_REASONING_EFFORT` | | Reasoning effort for consolidation LLM calls. Falls back to `FSCK_REASONING_EFFORT`, then `LLM_REASONING_EFFORT` |
 | `CONSOLIDATION_CHECK_INTERVAL` | `300` | How often the consolidation loop checks for idle sessions (seconds). Separate from idle threshold which controls eligibility |

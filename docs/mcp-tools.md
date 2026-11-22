@@ -40,7 +40,7 @@ mnemory exposes 17 tools via the [Model Context Protocol](https://modelcontextpr
 ### Storing Memories
 
 - **`infer=true`** (default): The server runs a single LLM call that extracts facts, classifies metadata (type, categories, importance), and deduplicates against existing memories. Always use this for normal operation.
-- **`infer=false`**: Skips the LLM call — content is embedded and stored directly. This bypasses fact extraction, deduplication, and contradiction resolution. Intended for server-side maintenance and bulk data import only, not for routine memory storage by agents.
+- **`infer=false`**: Requests storage as written, skipping fact extraction, deduplication, and contradiction resolution. Metadata can still be auto-classified. The server forces `infer=true` if `ALLOW_CLIENT_INFER` is disabled; otherwise `role=assistant` with `infer=false` is rejected unless `ALLOW_ASSISTANT_VERBATIM` is enabled. Successful adds report the effective `infer` mode.
 - **`add_memories`** (batch): Processes multiple memories in a single call, avoiding per-item round-trip latency.
 - **`labels`**: Client-provided key-value metadata that bypasses LLM extraction entirely. When using `infer=true`, labels are inherited by all extracted facts. See [Memory Model — Labels](memory-model.md#labels) for details.
 

@@ -513,8 +513,11 @@ async def add_memory(
         importance: low, normal, high, or critical.
         pinned: Load at every conversation start.
         agent_id: Scope to agent. Use "self" for yours.
-        infer: Run fact extraction and deduplication (default true). Leave
-            true unless performing maintenance or bulk import.
+        infer: True (default) extracts facts and deduplicates. False stores
+            content as written if allowed; the server forces true when
+            ALLOW_CLIENT_INFER is disabled. If false is allowed for clients,
+            assistant-role requests also require ALLOW_ASSISTANT_VERBATIM.
+            The result reports the effective infer mode.
         role: "user" (default) or "assistant" (requires agent_id).
         ttl_days: Time-to-live in days. Omit for type defaults.
         event_date: ISO 8601 datetime of when the event occurred.
@@ -529,13 +532,6 @@ async def add_memory(
         if collector:
             collector.record_operation("add_memory", uid, aid)
 
-        # Server-side infer control: when ALLOW_CLIENT_INFER=False,
-        # always use infer=True regardless of client request.
-        effective_infer = infer
-        if not infer and not _get_config().memory.allow_client_infer:
-            logger.debug("Overriding infer=False to True (ALLOW_CLIENT_INFER=False)")
-            effective_infer = True
-
         service = _get_service()
         result = await asyncio.to_thread(
             service.add_memory,
@@ -547,12 +543,13 @@ async def add_memory(
             categories=categories,
             importance=importance,
             pinned=pinned,
-            infer=effective_infer,
+            infer=infer,
             role=role,
             ttl_days=ttl_days,
             event_date=event_date,
             labels=labels,
             session_timezone=tz,
+            _client_request=True,
         )
         return json.dumps(result, default=str)
     except ValueError as e:
@@ -587,8 +584,9 @@ async def add_memories(
                   optional: memory_type, categories, importance, pinned,
                   role, ttl_days, event_date, labels.
         agent_id: Scope to agent. Use "self" for yours.
-        infer: Run fact extraction and deduplication (default true). Leave
-              true unless performing maintenance or bulk import.
+        infer: Extraction and deduplication mode for all items (default true).
+               Same rules as add_memory. The batch and each successful item
+               report the effective mode if any item succeeds.
         role: Default role for all items ("user" or "assistant").
     """
     try:
@@ -613,12 +611,6 @@ async def add_memories(
                 "message": f"Too many memories: {len(memories)} (max {MAX_BATCH_SIZE})",
             }
         )
-
-    # Server-side infer control
-    effective_infer = infer
-    if not infer and not _get_config().memory.allow_client_infer:
-        logger.debug("Overriding infer=False to True (ALLOW_CLIENT_INFER=False)")
-        effective_infer = True
 
     service = _get_service()
 
@@ -651,12 +643,13 @@ async def add_memories(
                     categories=mem.get("categories"),
                     importance=mem.get("importance"),
                     pinned=mem.get("pinned"),
-                    infer=effective_infer,
+                    infer=infer,
                     role=item_role,
                     ttl_days=mem.get("ttl_days"),
                     event_date=mem.get("event_date"),
                     labels=item_labels,
                     session_timezone=tz,
+                    _client_request=True,
                 )
                 # Check for error returned by add_memory (e.g., content too long)
                 if result.get("error"):
@@ -686,6 +679,7 @@ async def add_memories(
             "total": len(memories),
             "succeeded": len(results),
             "failed": len(errors),
+            **({"infer": results[0]["infer"]} if results else {}),
         },
         default=str,
     )

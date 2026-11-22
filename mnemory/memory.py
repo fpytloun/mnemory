@@ -460,6 +460,7 @@ class MemoryService:
         session_timezone: str | None = None,
         labels: dict[str, Any] | None = None,
         _trusted: bool = False,
+        _client_request: bool = False,
         _memory_id: str | None = None,
         _revision_metadata: dict[str, Any] | None = None,
         _source_kind: str | None = None,
@@ -498,9 +499,15 @@ class MemoryService:
             _trusted: Internal-only flag for trusted server-side callers
                   (consolidation, fsck). Allows infer=False with
                   role="assistant". Never exposed in MCP tools or REST API.
+            _client_request: Set by REST and MCP adapters, never by the caller.
+                  Apply client inference settings and report the effective mode.
 
         Returns dict with "results" key containing list of memory actions.
         """
+        if _client_request and not infer and not self._config.memory.allow_client_infer:
+            logger.debug("Overriding infer=False to True (ALLOW_CLIENT_INFER=False)")
+            infer = True
+
         # Validate inputs
         if role not in ("user", "assistant"):
             raise ValueError("role must be 'user' or 'assistant'")
@@ -511,11 +518,17 @@ class MemoryService:
         if role == "assistant" and not agent_id:
             raise ValueError("agent_id is required when role='assistant'")
 
-        # Agent identity memories must go through LLM extraction to prevent
-        # direct injection of arbitrary instructions as agent personality.
-        # Trusted internal callers (consolidation service) may bypass this
-        # because their content has already been through LLM processing.
-        if role == "assistant" and not infer and not _trusted:
+        # Keep direct writes to agent identity off by default to mitigate
+        # persistent prompt injection. The client opt-in only affects this
+        # guard and cannot undo the inference override above.
+        if (
+            role == "assistant"
+            and not infer
+            and not (
+                _trusted
+                or (_client_request and self._config.memory.allow_assistant_verbatim)
+            )
+        ):
             raise ValueError(
                 "infer=False is not allowed for role='assistant'. "
                 "Agent identity memories must go through fact extraction "
@@ -623,6 +636,8 @@ class MemoryService:
         self._core_cache.invalidate_prefix(user_id)
         self._category_cache.invalidate(user_id)
 
+        if _client_request and not result.get("error"):
+            return {**result, "infer": infer}
         return result
 
     def remember(

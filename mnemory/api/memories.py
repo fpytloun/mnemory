@@ -112,14 +112,6 @@ def add_memory(
     _record("add_memory", ctx)
     service = _get_service()
 
-    # Server-side infer control
-    from mnemory.server import _get_config
-
-    effective_infer = req.infer
-    if not req.infer and not _get_config().memory.allow_client_infer:
-        logger.debug("Overriding infer=False to True (ALLOW_CLIENT_INFER=False)")
-        effective_infer = True
-
     try:
         result = service.add_memory(
             content=req.content,
@@ -130,12 +122,13 @@ def add_memory(
             categories=req.categories,
             importance=req.importance,
             pinned=req.pinned,
-            infer=effective_infer,
+            infer=req.infer,
             role=req.role,
             ttl_days=req.ttl_days,
             event_date=req.event_date,
             session_timezone=ctx.timezone,
             labels=req.labels,
+            _client_request=True,
         )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
@@ -157,18 +150,9 @@ def add_memories_batch(
     _record("add_memories", ctx)
     service = _get_service()
 
-    # Server-side infer control
-    from mnemory.server import _get_config
-
-    allow_infer = _get_config().memory.allow_client_infer
-
     results = []
     for item in req.memories:
         try:
-            effective_infer = item.infer
-            if not item.infer and not allow_infer:
-                effective_infer = True
-
             result = service.add_memory(
                 content=item.content,
                 user_id=ctx.user_id,
@@ -178,12 +162,13 @@ def add_memories_batch(
                 categories=item.categories,
                 importance=item.importance,
                 pinned=item.pinned,
-                infer=effective_infer,
+                infer=item.infer,
                 role=item.role,
                 ttl_days=item.ttl_days,
                 event_date=item.event_date,
                 session_timezone=ctx.timezone,
                 labels=item.labels,
+                _client_request=True,
             )
             results.append(result)
         except Exception:

@@ -131,7 +131,11 @@ class AddMemoryRequest(BaseModel):
     )
     infer: bool = Field(
         True,
-        description="Use LLM for fact extraction and dedup (True) or store as-is (False)",
+        description=(
+            "Extract facts and deduplicate (true), or store as written if allowed "
+            "(false). Assistant verbatim writes require both ALLOW_CLIENT_INFER "
+            "and ALLOW_ASSISTANT_VERBATIM."
+        ),
     )
     role: Literal["user", "assistant"] = Field(
         "user", description="Who this memory is about: 'user' or 'assistant'"
@@ -201,6 +205,10 @@ class AddMemoryResponse(BaseModel):
     """Response from adding memory/memories."""
 
     results: list[MemoryActionResult] = Field(default_factory=list)
+    infer: bool | None = Field(
+        None,
+        description="Effective fact extraction and deduplication mode; null on failure.",
+    )
     artifact: ArtifactInfo | None = None
     error: bool = False
     message: str | None = None

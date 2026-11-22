@@ -654,6 +654,10 @@ class MemoryConfig:
     allow_client_infer: bool = field(
         default_factory=lambda: _env_bool("ALLOW_CLIENT_INFER", True)
     )
+    # Opt in to assistant-role verbatim writes when clients may disable inference.
+    allow_assistant_verbatim: bool = field(
+        default_factory=lambda: _env_bool("ALLOW_ASSISTANT_VERBATIM", False)
+    )
 
     # Days to retain superseded raw memories before garbage collection.
     # Raw memories with artifacts are always retained regardless.
